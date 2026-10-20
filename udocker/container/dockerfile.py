@@ -102,8 +102,10 @@ class ContainerBuilder(object):
     container previously created from the FROM image, and optionally
     commits the result as a new image in the local repository.
 
-    Limitations: ADD does not fetch remote URLs, and RUN executes using
-    the execution mode currently configured for the container.
+    Limitations: ADD does not fetch remote URLs, RUN executes using the
+    execution mode currently configured for the container, and commit()
+    packs the whole container filesystem into a single layer (docker
+    produces diff layers, so images grow with each build).
     """
 
     SHELL_CMD = ["/bin/sh", "-c"]
@@ -133,6 +135,7 @@ class ContainerBuilder(object):
         self.args = {}
         self.build_args = {}
         self.stage_roots = {}
+        self.shell = list(self.SHELL_CMD)
 
     def set_build_args(self, build_arg_list):
         """Register --build-arg VAR=VALUE overrides"""
@@ -199,6 +202,77 @@ class ContainerBuilder(object):
     def _is_tar(path):
         return path.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2",
                               ".tbz2", ".tar.xz", ".txz"))
+
+    @staticmethod
+    def _within(root, path):
+        """Check that path stays within root, resolving '..' and
+        symlinks. Used to keep COPY/ADD/VOLUME and tar extraction
+        from escaping the build context or the container ROOT"""
+        real_root = os.path.realpath(root)
+        real_path = os.path.realpath(path)
+        return real_path == real_root or \
+            real_path.startswith(real_root + os.sep)
+
+    @classmethod
+    def _safe_member(cls, target_dir, member):
+        """Validate that a tar member cannot escape target_dir.
+        Absolute symlinks are allowed, they resolve inside the
+        container root, escaping relative links are not"""
+        if not cls._within(target_dir, os.path.join(target_dir, member.name)):
+            return False
+        if member.issym():
+            link = member.linkname
+            if not link.startswith("/"):
+                link = os.path.join(os.path.dirname(member.name), link)
+            return cls._within(target_dir,
+                               target_dir + "/" + link.lstrip("/"))
+        if member.islnk():
+            return cls._within(target_dir,
+                               os.path.join(target_dir, member.linkname))
+        return True
+
+    def _extract_tar(self, src, target_dir):
+        """Extract a tar archive into target_dir. Members are validated
+        one by one against previously extracted symlinks so that a
+        member cannot be redirected outside the container"""
+        try:
+            with tarfile.open(src) as tfile:
+                if hasattr(tarfile, "fully_trusted_filter"):
+                    extract_args = {"filter": "fully_trusted"}
+                else:
+                    extract_args = {}
+                for member in tfile.getmembers():
+                    if not self._safe_member(target_dir, member):
+                        Msg().err("Error: refusing to extract unsafe member:",
+                                  member.name)
+                        return False
+                    tfile.extract(member, target_dir, **extract_args)
+                    self._restore_xattrs(member, target_dir)
+        except (tarfile.TarError, IOError, OSError) as error:
+            Msg().err("Error: extracting:", src, error)
+            return False
+        return True
+
+    @staticmethod
+    def _restore_xattrs(member, target_dir):
+        """Restore pax extended attributes of an extracted tar member.
+        Docker preserves them; without privileges some attributes
+        (e.g. security.*) cannot be set, a warning is issued then"""
+        if not hasattr(os, "setxattr") or member.issym() or member.islnk():
+            return
+        headers = getattr(member, "pax_headers", None)
+        if not headers:
+            return
+        path = os.path.join(target_dir, member.name)
+        for (key, value) in headers.items():
+            if not key.startswith("SCHILY.xattr."):
+                continue
+            name = key[len("SCHILY.xattr."):]
+            try:
+                os.setxattr(path, name, value.encode("utf-8"))
+            except (IOError, OSError, UnicodeError) as error:
+                Msg().out("Warning: cannot restore xattr", name, ":",
+                          error, l=Msg.WAR)
 
     def run_instructions(self, instructions):
         """Apply all parsed Dockerfile instructions of a single stage,
@@ -279,6 +353,18 @@ class ContainerBuilder(object):
         self.config["User"] = user
         return True
 
+    def _do_shell(self, arg):
+        try:
+            shell = json.loads(arg)
+        except ValueError:
+            shell = None
+        if not (isinstance(shell, list) and shell and
+                all(isinstance(item, str) for item in shell)):
+            Msg().err("Error: SHELL requires a JSON array of strings")
+            return False
+        self.shell = shell
+        return True
+
     def _do_label(self, arg):
         try:
             tokens = shlex.split(arg)
@@ -298,9 +384,11 @@ class ContainerBuilder(object):
     def _do_expose(self, arg):
         exposed = dict(self.config.get("ExposedPorts") or {})
         for port in arg.split():
-            if "/" not in port:
-                port += "/tcp"
-            exposed[port] = {}
+            match = re.match(r"^(\d+)(?:/(tcp|udp|sctp))?$", port)
+            if not match or not 1 <= int(match.group(1)) <= 65535:
+                Msg().err("Error: invalid EXPOSE port:", port)
+                return False
+            exposed["%s/%s" % (match.group(1), match.group(2) or "tcp")] = {}
         self.config["ExposedPorts"] = exposed
         return True
 
@@ -313,40 +401,182 @@ class ContainerBuilder(object):
             return False
         volumes = dict(self.config.get("Volumes") or {})
         for vol in tokens:
+            vol_path = os.path.normpath(self.container_root + vol)
+            if not self._within(self.container_root, vol_path):
+                Msg().err("Error: VOLUME outside container:", vol)
+                return False
             volumes[vol] = {}
-            self._ensure_dir(self.container_root + vol)
+            self._ensure_dir(vol_path)
         self.config["Volumes"] = volumes
         return True
 
     def _do_cmd(self, arg):
         (is_exec, cmd) = self._parse_cmd_form(arg)
-        self.config["Cmd"] = cmd if is_exec else self.SHELL_CMD + [cmd]
+        self.config["Cmd"] = cmd if is_exec else self.shell + [cmd]
         return True
 
     def _do_entrypoint(self, arg):
         (is_exec, cmd) = self._parse_cmd_form(arg)
-        self.config["Entrypoint"] = cmd if is_exec else self.SHELL_CMD + [cmd]
+        self.config["Entrypoint"] = cmd if is_exec else self.shell + [cmd]
         return True
 
-    def _copy_one(self, src, dest_path, dest_is_dir, allow_extract):
+    @classmethod
+    def _chmod_spec(cls, spec, mode, is_dir):
+        """Return the mode after applying a docker --chmod spec
+        (octal or symbolic) to mode, None if the spec is invalid"""
+        spec = spec.strip()
+        if re.match(r"^[0-7]{3,4}$", spec):
+            return int(spec, 8)
+        result = mode
+        for clause in spec.split(","):
+            copy = re.match(r"^([ugo])=([ugo])$", clause)
+            if copy:
+                (dst, src) = copy.groups()
+                src_bits = (result >> {"o": 0, "g": 3, "u": 6}[src]) & 0o7
+                shift = {"o": 0, "g": 3, "u": 6}[dst]
+                mask = 0o7 << shift
+                result = (result & ~mask) | (src_bits << shift)
+                continue
+            match = re.match(r"^([ugoa]*)([-+=])([rwxX]*)$", clause)
+            if not match:
+                return None
+            (who, op, perms) = match.groups()
+            if not who:
+                who = "a"
+            bits = 0
+            for perm in perms:
+                if perm == "r":
+                    bits |= 0o444
+                elif perm == "w":
+                    bits |= 0o222
+                elif perm == "x":
+                    bits |= 0o111
+                elif perm == "X" and (is_dir or (result & 0o111)):
+                    bits |= 0o111
+            mask = 0
+            for letter in who:
+                mask |= {"u": 0o700, "g": 0o070, "o": 0o007,
+                         "a": 0o777}[letter]
+            bits &= mask
+            if op == "+":
+                result |= bits
+            elif op == "-":
+                result &= ~bits
+            else:
+                result = (result & ~mask) | bits
+        return result
+
+    @classmethod
+    def _walk_entries(cls, path):
+        """Return a file/directory and its contents (no symlink follow)"""
+        if os.path.isdir(path) and not os.path.islink(path):
+            entries = []
+            for (root, dirs, files) in os.walk(path):
+                entries.append(root)
+                entries.extend([os.path.join(root, name)
+                                for name in dirs + files])
+            return entries
+        return [path]
+
+    @classmethod
+    def _apply_chmod(cls, path, spec):
+        """Apply a --chmod spec to a copied file or directory tree"""
+        for entry in cls._walk_entries(path):
+            if os.path.islink(entry):
+                continue
+            mode = cls._chmod_spec(spec, os.stat(entry).st_mode & 0o7777,
+                                   os.path.isdir(entry))
+            if mode is None:
+                Msg().err("Error: invalid --chmod:", spec)
+                return False
+            try:
+                os.chmod(entry, mode)
+            except (IOError, OSError) as error:
+                Msg().err("Error: applying --chmod:", entry, error)
+                return False
+        return True
+
+    def _resolve_id(self, value, passwd_file, field):
+        """Resolve a user/group name or numeric id against the
+        container's /etc/passwd or /etc/group, None if not found"""
+        if value.isdigit():
+            return int(value)
+        try:
+            with open(self.container_root + passwd_file, "r") as filep:
+                for line in filep:
+                    parts = line.split(":")
+                    if parts[0] == value and len(parts) > field:
+                        return int(parts[field])
+        except (IOError, OSError, ValueError):
+            pass
+        return None
+
+    def _apply_chown(self, path, spec):
+        """Apply a --chown spec (user[:group]) to a copied file or tree.
+        Names are resolved in the container as docker does. If the
+        ownership cannot be changed because udocker runs unprivileged
+        a warning is issued and the build continues"""
+        if ":" in spec:
+            (user, group) = spec.split(":", 1)
+        else:
+            (user, group) = (spec, "")
+        uid = gid = -1
+        if user:
+            uid = self._resolve_id(user, "/etc/passwd", 2)
+            if uid is None:
+                Msg().err("Error: --chown user not found in container:",
+                          user)
+                return False
+            if user.isdigit():
+                gid = uid
+            elif not group:
+                gid = self._resolve_id(user, "/etc/passwd", 3)
+                if gid is None:
+                    Msg().err("Error: --chown user not found in container:",
+                              user)
+                    return False
+        if group:
+            gid = self._resolve_id(group, "/etc/group", 2)
+            if gid is None:
+                Msg().err("Error: --chown group not found in container:",
+                          group)
+                return False
+        for entry in self._walk_entries(path):
+            if os.path.islink(entry):
+                continue
+            try:
+                os.chown(entry, uid, gid)
+            except (IOError, OSError) as error:
+                Msg().out("Warning: cannot change ownership (udocker runs "
+                          "unprivileged), --chown not applied:", error,
+                          l=Msg.WAR)
+                return True
+        return True
+
+    def _copy_one(self, src, dest_path, dest_is_dir, allow_extract,
+                  chown=None, chmod=None):
         """Copy or extract a single resolved source path into dest_path"""
         if os.path.isdir(src):
             self._ensure_dir(dest_path)
-            return FileUtil(src).copydir(dest_path)
-        if allow_extract and self._is_tar(src):
-            target_dir = dest_path if dest_is_dir else os.path.dirname(dest_path)
-            self._ensure_dir(target_dir)
-            try:
-                with tarfile.open(src) as tfile:
-                    tfile.extractall(target_dir)
-            except (tarfile.TarError, IOError, OSError) as error:
-                Msg().err("Error: extracting:", src, error)
+            if not FileUtil(src).copydir(dest_path):
                 return False
-            return True
-        target = os.path.join(dest_path, os.path.basename(src)) \
-            if dest_is_dir else dest_path
-        self._ensure_dir(os.path.dirname(target))
-        return FileUtil(src).copyto(target)
+            target = dest_path
+        elif allow_extract and self._is_tar(src):
+            target = dest_path if dest_is_dir else os.path.dirname(dest_path)
+            self._ensure_dir(target)
+            if not self._extract_tar(src, target):
+                return False
+        else:
+            target = os.path.join(dest_path, os.path.basename(src)) \
+                if dest_is_dir else dest_path
+            self._ensure_dir(os.path.dirname(target))
+            if not FileUtil(src).copyto(target):
+                return False
+        if chown and not self._apply_chown(target, chown):
+            return False
+        if chmod and not self._apply_chmod(target, chmod):
+            return False
+        return True
 
     def _copy_or_add(self, arg, allow_extract):
         try:
@@ -355,15 +585,35 @@ class ContainerBuilder(object):
             Msg().err("Error: parsing COPY/ADD arguments:", error)
             return False
         from_stage = None
+        chown = None
+        chmod = None
+        unpack = True
         plain_tokens = []
         for tok in tokens:
             if tok.startswith("--from="):
                 from_stage = tok.split("=", 1)[1]
+            elif tok.startswith("--chown="):
+                chown = tok.split("=", 1)[1]
+            elif tok.startswith("--chmod="):
+                chmod = tok.split("=", 1)[1]
+            elif tok.startswith("--checksum="):
+                Msg().out("Warning: --checksum only applies to remote "
+                          "sources, ignored:", tok, l=Msg.WAR)
+            elif tok.startswith("--link"):
+                Msg().out("Warning: --link is not supported, ignored:",
+                          tok, l=Msg.WAR)
+            elif allow_extract and tok.startswith("--unpack="):
+                unpack = tok.split("=", 1)[1].lower() not in ("false", "0")
             elif tok.startswith("--"):
-                continue
+                Msg().out("Warning: unsupported flag ignored:", tok,
+                          l=Msg.WAR)
             else:
                 plain_tokens.append(tok)
         tokens = plain_tokens
+        if chmod is not None and \
+                self._chmod_spec(chmod, 0o644, False) is None:
+            Msg().err("Error: invalid --chmod:", chmod)
+            return False
         if len(tokens) < 2:
             Msg().err("Error: COPY/ADD requires source(s) and a destination:",
                       arg)
@@ -373,6 +623,10 @@ class ContainerBuilder(object):
         dest = dest_arg if dest_arg.startswith("/") else \
             (self.config.get("WorkingDir") or "/").rstrip("/") + "/" + dest_arg
         dest_path = os.path.normpath(self.container_root + dest)
+        if not self._within(self.container_root, dest_path):
+            Msg().err("Error: COPY/ADD destination outside container:",
+                      dest_arg)
+            return False
         dest_is_dir = dest_arg.endswith("/") or len(sources) > 1 or \
             os.path.isdir(dest_path)
         if dest_is_dir:
@@ -396,8 +650,13 @@ class ContainerBuilder(object):
                 Msg().err("Error: COPY/ADD source not found:", src)
                 return False
             for match in matches:
+                if not self._within(src_root, match):
+                    Msg().err("Error: COPY/ADD source outside build context:",
+                              src)
+                    return False
                 if not self._copy_one(match, dest_path, dest_is_dir,
-                                      allow_extract):
+                                      allow_extract and unpack,
+                                      chown, chmod):
                     return False
         return True
 
@@ -424,7 +683,7 @@ class ContainerBuilder(object):
             Msg().err("Error: RUN requires a command")
             return False
         (is_exec, cmd) = self._parse_cmd_form(arg)
-        cmd_list = cmd if is_exec else self.SHELL_CMD + [cmd]
+        cmd_list = cmd if is_exec else self.shell + [cmd]
         exec_mode = ExecutionMode(self.localrepo, self.container_id)
         exec_engine = exec_mode.get_engine()
         if not exec_engine:

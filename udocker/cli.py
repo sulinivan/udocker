@@ -314,7 +314,10 @@ class UdockerCLI(object):
             return self.STATUS_ERROR
         if imagerepo and not self._check_imagerepo(imagerepo):
             return self.STATUS_ERROR
-        repos = self.localfileapi.load(imagefile, imagerepo)
+        tag = None
+        if imagerepo and ':' in imagerepo:
+            (imagerepo, tag) = imagerepo.rsplit(':', 1)
+        repos = self.localfileapi.load(imagefile, imagerepo, tag)
         if not repos:
             Msg().err("Error: load failed")
             return self.STATUS_ERROR
@@ -1188,6 +1191,15 @@ class UdockerCLI(object):
             if not self.dockerioapi.get(base_imagerepo, base_tag, platform):
                 Msg().err("Error: pulling base image failed:", base_imagespec)
                 return None
+
+        if self.localrepo.cd_imagerepo(base_imagerepo, base_tag):
+            image_platform = self.localrepo.get_image_platform_fmt()
+            wanted = platform or (HostInfo().osversion() + "/" +
+                                  HostInfo().arch("docker"))
+            if isinstance(image_platform, str) and \
+                    image_platform != wanted and "unknown" not in image_platform:
+                Msg().out("Warning: base image platform", image_platform,
+                          "differs from", wanted, l=Msg.WAR)
 
         container_id = self._create(base_imagerepo + ":" + base_tag)
         if not container_id:

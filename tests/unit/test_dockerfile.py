@@ -5,7 +5,9 @@ udocker unit tests: DockerfileParser and ContainerBuilder
 """
 
 import os
+import io
 import shutil
+import tarfile
 import tempfile
 from unittest import TestCase, main
 from unittest.mock import Mock, patch
@@ -332,6 +334,201 @@ class ContainerBuilderTestCase(TestCase):
         mock_fileutil.return_value.tar.return_value = False
         status = builder.commit("myrepo/myimage", "latest")
         self.assertFalse(status)
+
+    def test_27_do_copy_source_outside_context(self):
+        """Test27 COPY refuses sources resolving outside the context."""
+        tmpdir = tempfile.mkdtemp()
+        try:
+            context = os.path.join(tmpdir, "ctx")
+            container = os.path.join(tmpdir, "container")
+            os.makedirs(context)
+            os.makedirs(container + "/ROOT")
+            with open(os.path.join(tmpdir, "outside.txt"), "w") as filep:
+                filep.write("secret")
+            self.mock_lrepo.cd_container.return_value = container
+            builder = ContainerBuilder(self.mock_lrepo, "CID", context)
+            status = builder._do_copy("../outside.txt /leaked.txt")
+            self.assertFalse(status)
+            self.assertFalse(os.path.exists(container + "/ROOT/leaked.txt"))
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_28_do_copy_destination_outside_root(self):
+        """Test28 COPY refuses destinations outside the container ROOT."""
+        tmpdir = tempfile.mkdtemp()
+        try:
+            context = os.path.join(tmpdir, "ctx")
+            container = os.path.join(tmpdir, "container")
+            os.makedirs(context)
+            os.makedirs(container + "/ROOT")
+            with open(os.path.join(context, "f.txt"), "w") as filep:
+                filep.write("x")
+            self.mock_lrepo.cd_container.return_value = container
+            builder = ContainerBuilder(self.mock_lrepo, "CID", context)
+            target = os.path.join(tmpdir, "escaped.txt")
+            dest = "/" + "../" * 10 + target.lstrip("/")
+            status = builder._do_copy("f.txt " + dest)
+            self.assertFalse(status)
+            self.assertFalse(os.path.exists(target))
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_29_extract_tar_refuses_escaping_member(self):
+        """Test29 ADD refuses tar members escaping the destination."""
+        tmpdir = tempfile.mkdtemp()
+        try:
+            root = os.path.join(tmpdir, "ROOT")
+            os.makedirs(root)
+            target = os.path.join(tmpdir, "tarslip.txt")
+            tarpath = os.path.join(tmpdir, "evil.tar")
+            with tarfile.open(tarpath, "w") as tfile:
+                data = b"pwn"
+                info = tarfile.TarInfo("/".join([".."] * 10) + target)
+                info.size = len(data)
+                tfile.addfile(info, io.BytesIO(data))
+            builder = self._builder()
+            self.assertFalse(builder._extract_tar(tarpath, root))
+            self.assertFalse(os.path.exists(target))
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_30_safe_member_symlink_escape(self):
+        """Test30 tar members cannot escape through an extracted symlink."""
+        root = tempfile.mkdtemp()
+        try:
+            link = tarfile.TarInfo("evil")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "/etc"
+            self.assertTrue(ContainerBuilder._safe_member(root, link))
+            os.symlink("/etc", os.path.join(root, "evil"))
+            through = tarfile.TarInfo("evil/passwd")
+            self.assertFalse(ContainerBuilder._safe_member(root, through))
+        finally:
+            shutil.rmtree(root)
+
+    def test_31_chmod_spec(self):
+        """Test31 --chmod accepts octal and symbolic notation."""
+        self.assertEqual(ContainerBuilder._chmod_spec("755", 0o644, False),
+                         0o755)
+        self.assertEqual(ContainerBuilder._chmod_spec("+x", 0o644, False),
+                         0o755)
+        self.assertEqual(ContainerBuilder._chmod_spec("u=rwX,go=rX", 0o644,
+                                                      False), 0o644)
+        self.assertEqual(ContainerBuilder._chmod_spec("u=rwX,go=rX", 0o644,
+                                                      True), 0o755)
+        self.assertEqual(ContainerBuilder._chmod_spec("g=u", 0o600, False),
+                         0o660)
+        self.assertIsNone(ContainerBuilder._chmod_spec("abc", 0o644, False))
+
+    def test_32_do_copy_chmod(self):
+        """Test32 COPY --chmod applies the mode to copied files."""
+        tmpdir = tempfile.mkdtemp()
+        try:
+            context = os.path.join(tmpdir, "ctx")
+            container = os.path.join(tmpdir, "container")
+            os.makedirs(context)
+            os.makedirs(container + "/ROOT")
+            with open(os.path.join(context, "f.txt"), "w") as filep:
+                filep.write("x")
+            os.chmod(os.path.join(context, "f.txt"), 0o600)
+            self.mock_lrepo.cd_container.return_value = container
+            builder = ContainerBuilder(self.mock_lrepo, "CID", context)
+            self.assertTrue(builder._do_copy("--chmod=755 f.txt /f.txt"))
+            target = container + "/ROOT/f.txt"
+            self.assertEqual(os.stat(target).st_mode & 0o777, 0o755)
+            self.assertFalse(builder._do_copy("--chmod=abc f.txt /g.txt"))
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_33_do_copy_chown(self):
+        """Test33 COPY --chown accepts numeric ids, unknown names fail."""
+        tmpdir = tempfile.mkdtemp()
+        try:
+            context = os.path.join(tmpdir, "ctx")
+            container = os.path.join(tmpdir, "container")
+            os.makedirs(context)
+            os.makedirs(container + "/ROOT")
+            with open(os.path.join(context, "f.txt"), "w") as filep:
+                filep.write("x")
+            self.mock_lrepo.cd_container.return_value = container
+            builder = ContainerBuilder(self.mock_lrepo, "CID", context)
+            self.assertTrue(builder._do_copy(
+                "--chown=1000:1000 f.txt /f.txt"))
+            self.assertFalse(builder._do_copy(
+                "--chown=nosuchuser f.txt /g.txt"))
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_34_do_shell(self):
+        """Test34 SHELL sets the shell used by shell form commands."""
+        builder = self._builder()
+        self.assertTrue(builder._do_shell('["/bin/bash", "-c"]'))
+        self.assertEqual(builder.shell, ["/bin/bash", "-c"])
+        builder._do_cmd("echo hi")
+        self.assertEqual(builder.config["Cmd"],
+                         ["/bin/bash", "-c", "echo hi"])
+        self.assertFalse(builder._do_shell("bash"))
+        self.assertFalse(builder._do_shell("[]"))
+
+    def test_35_do_expose(self):
+        """Test35 EXPOSE validates ports."""
+        builder = self._builder()
+        self.assertTrue(builder._do_expose("8080 53/udp"))
+        self.assertEqual(builder.config["ExposedPorts"],
+                         {"8080/tcp": {}, "53/udp": {}})
+        self.assertFalse(builder._do_expose("abc"))
+        self.assertFalse(builder._do_expose("70000"))
+
+    def test_36_do_add_unpack_false(self):
+        """Test36 ADD --unpack=false copies the archive as a file."""
+        tmpdir = tempfile.mkdtemp()
+        try:
+            context = os.path.join(tmpdir, "ctx")
+            container = os.path.join(tmpdir, "container")
+            os.makedirs(context)
+            os.makedirs(container + "/ROOT")
+            with tarfile.open(os.path.join(context, "a.tar"), "w") as tfile:
+                data = b"content"
+                info = tarfile.TarInfo("inner.txt")
+                info.size = len(data)
+                tfile.addfile(info, io.BytesIO(data))
+            self.mock_lrepo.cd_container.return_value = container
+            builder = ContainerBuilder(self.mock_lrepo, "CID", context)
+            self.assertTrue(builder._do_add("--unpack=false a.tar /a.tar"))
+            self.assertTrue(os.path.isfile(container + "/ROOT/a.tar"))
+            self.assertFalse(os.path.exists(container + "/ROOT/inner.txt"))
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_37_extract_tar_xattrs(self):
+        """Test37 ADD restores pax extended attributes."""
+        if not hasattr(os, "setxattr"):
+            return
+        tmpdir = tempfile.mkdtemp()
+        try:
+            root = os.path.join(tmpdir, "ROOT")
+            os.makedirs(root)
+            probe = os.path.join(tmpdir, "probe")
+            with open(probe, "w"):
+                pass
+            try:
+                os.setxattr(probe, "user.test", b"1")
+            except (IOError, OSError):
+                return
+            tarpath = os.path.join(tmpdir, "x.tar")
+            with tarfile.open(tarpath, "w",
+                              format=tarfile.PAX_FORMAT) as tfile:
+                data = b"x"
+                info = tarfile.TarInfo("x.txt")
+                info.size = len(data)
+                info.pax_headers = {"SCHILY.xattr.user.test": "1"}
+                tfile.addfile(info, io.BytesIO(data))
+            builder = self._builder()
+            self.assertTrue(builder._extract_tar(tarpath, root))
+            self.assertEqual(os.getxattr(os.path.join(root, "x.txt"),
+                                         "user.test"), b"1")
+        finally:
+            shutil.rmtree(tmpdir)
 
 
 if __name__ == '__main__':
