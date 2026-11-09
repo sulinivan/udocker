@@ -87,7 +87,10 @@ class UMain(object):
             "tag": self.cli.do_tag, "manifest": self.cli.do_manifest,
             "build": self.cli.do_build, "commit": self.cli.do_commit,
             "history": self.cli.do_history, "cp": self.cli.do_cp,
-            "push": self.cli.do_push,
+            "push": self.cli.do_push, "start": self.cli.do_start,
+            "stop": self.cli.do_stop, "restart": self.cli.do_restart,
+            "kill": self.cli.do_kill, "exec": self.cli.do_exec,
+            "logs": self.cli.do_logs, "wait": self.cli.do_wait,
         }
 
         if ((len(self.argv) == 1) or

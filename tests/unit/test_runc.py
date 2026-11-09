@@ -574,7 +574,6 @@ class RuncEngineTestCase(TestCase):
         self.assertTrue(rcex._filebind.add_file.called)
 
     @patch('udocker.engine.runc.FileBind')
-    @patch('udocker.engine.runc.Unique')
     @patch.object(RuncEngine, '_set_id_mappings')
     @patch.object(RuncEngine, '_del_namespace_spec')
     @patch.object(RuncEngine, '_del_mount_spec')
@@ -604,7 +603,7 @@ class RuncEngineTestCase(TestCase):
                     mock_run_banner, mock_del_mount_spec, mock_inv_opt,
                     mock_pty, mock_nopty, mock_delmnt, mock_delns,
                     mock_setid,
-                    mock_unique, mock_fbind):
+                    mock_fbind):
         """Test17 RuncEngine().run()."""
         mock_run_init.return_value = False
         mock_delmnt.return_value = None
@@ -652,7 +651,6 @@ class RuncEngineTestCase(TestCase):
         mock_modms.return_value = None
         mock_prooto.return_value = None
         mock_savespec.return_value = None
-        mock_unique.return_value.uuid.return_value = "EXECUTION_ID"
         mock_run_banner.return_value = None
         mock_pty.return_value = 0
         mock_nopty.return_value = 0

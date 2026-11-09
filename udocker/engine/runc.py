@@ -14,11 +14,11 @@ from udocker.config import Config
 from udocker.engine.base import ExecutionEngineCommon
 from udocker.engine.proot import PRootEngine
 from udocker.engine.nvidia import NvidiaMode
-from udocker.helper.unique import Unique
 from udocker.helper.hostinfo import HostInfo
 from udocker.utils.fileutil import FileUtil
 from udocker.utils.uvolume import Uvolume
 from udocker.utils.filebind import FileBind
+from udocker.utils.runcenv import runc_container_id, runtime_env
 
 
 class RuncEngine(ExecutionEngineCommon):
@@ -73,6 +73,20 @@ class RuncEngine(ExecutionEngineCommon):
         elif "runsc" in os.path.basename(self.executable):
             self.engine_type = "runsc"
 
+    def _cleanup_stale(self):
+        """Remove a stale runc container left by a previous crash"""
+        if not (self.executable and self._container_specdir
+                and self.execution_id):
+            return
+        cmd = [self.executable, "--root", self._container_specdir,
+               "delete", "--force", self.execution_id]
+        try:
+            subprocess.call(cmd, env=runtime_env(Config.conf['topdir']),
+                            stdout=Msg.chldnul, stderr=Msg.chldnul,
+                            close_fds=True)
+        except (OSError, ValueError, TypeError):
+            pass
+
     def _load_spec(self, new=False):
         """Generate runc spec file"""
         if FileUtil(self._container_specfile).size() != -1 and new:
@@ -91,6 +105,7 @@ class RuncEngine(ExecutionEngineCommon):
 
             status = subprocess.call(cmd_l, shell=False, stderr=Msg.chlderr,
                                      close_fds=True,
+                                     env=runtime_env(Config.conf['topdir']),
                                      cwd=os.path.realpath(self._container_specdir))
             if status:
                 return False
@@ -386,6 +401,10 @@ class RuncEngine(ExecutionEngineCommon):
         self._filebind = FileBind(self.localrepo, container_id)
         self._filebind.setup()
         self.select_runc()
+        # deterministic id so the supervisor can address the container
+        # later (exec/kill/logs/state) without keeping extra state
+        self.execution_id = runc_container_id(self.container_id)
+        self._cleanup_stale()
 
         # create new OCI spec file
         if not self._load_spec(new=True):
@@ -423,7 +442,6 @@ class RuncEngine(ExecutionEngineCommon):
             runc_debug = []
 
         # build the actual command
-        self.execution_id = Unique().uuid(self.container_id)
         cmd_l = self._set_cpu_affinity()
         cmd_l.append(self.executable)
         cmd_l.extend(runc_debug)
@@ -441,7 +459,8 @@ class RuncEngine(ExecutionEngineCommon):
 
     def run_pty(self, cmd_l):
         """runc from a terminal"""
-        status = subprocess.call(cmd_l, shell=False, close_fds=True)
+        status = subprocess.call(cmd_l, shell=False, close_fds=True,
+                                 env=runtime_env(Config.conf['topdir']))
         self._filebind.finish()
         return status
 
@@ -449,7 +468,8 @@ class RuncEngine(ExecutionEngineCommon):
         """runc without a terminal"""
         (pmaster, pslave) = os.openpty()
         status = subprocess.Popen(cmd_l, shell=False, close_fds=False,
-                                  stdout=pslave, stderr=pslave)
+                                  stdout=pslave, stderr=pslave,
+                                  env=runtime_env(Config.conf['topdir']))
         os.close(pslave)
         while True:
             status.poll()
@@ -465,6 +485,7 @@ class RuncEngine(ExecutionEngineCommon):
                         sys.stdout.write(os.read(pmaster, 1).decode())
                     else:
                         sys.stdout.write(os.read(pmaster, 1))
+                    sys.stdout.flush()
                 except OSError:
                     break
         try:

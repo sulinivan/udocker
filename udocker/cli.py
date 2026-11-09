@@ -26,6 +26,8 @@ from udocker.utils.fileutil import FileUtil
 from udocker.utils.filebind import FileBind
 from udocker.utils.mountpoint import MountPoint
 from udocker.utils.portforward import PortForwarder
+from udocker.utils.containerpath import container_realpath
+from udocker import supervisor
 
 # if Python 3
 if sys.version_info[0] >= 3:
@@ -170,49 +172,8 @@ class UdockerCLI(object):
 
     @staticmethod
     def _container_realpath(container_root, path, follow_final=True):
-        """Resolve a path inside the container ROOT without escaping it.
-        Absolute symlinks are interpreted relative to the container root,
-        as they are when the container executes. The final path component
-        is followed only if follow_final is True. Returns None when the
-        resolved path would escape the container root.
-        """
-        root = os.path.realpath(container_root)
-        parts = [part for part in str(path).split("/")
-                 if part not in ("", ".")]
-        current = root
-        hops = 0
-        while parts:
-            part = parts.pop(0)
-            if not parts and not follow_final:
-                current = os.path.join(current, part)
-                break
-            if part == "..":
-                parent = os.path.dirname(current)
-                if parent != root and not parent.startswith(root + os.sep):
-                    return None
-                current = parent
-                continue
-            candidate = os.path.join(current, part)
-            if os.path.islink(candidate):
-                hops += 1
-                if hops > 40:
-                    return None
-                link = os.readlink(candidate)
-                if link.startswith("/"):
-                    current = root
-                parts = [item for item in link.split("/")
-                         if item not in ("", ".")] + parts
-                continue
-            current = candidate
-        current = os.path.normpath(current)
-        if current != root and not current.startswith(root + os.sep):
-            return None
-        if not follow_final:
-            return current
-        real = os.path.realpath(current)
-        if real != root and not real.startswith(root + os.sep):
-            return None
-        return real
+        """Resolve a path inside the container ROOT without escaping it"""
+        return container_realpath(container_root, path, follow_final)
 
     def _parse_cp_arg(self, arg):
         """Split a cp argument into (container_id, path).
@@ -969,6 +930,7 @@ class UdockerCLI(object):
         --platform=os/arch         :pull image for OS and architecture
         --pull=<when>              :when to pull (missing|never|always|reuse)
         --httpproxy=<proxy>        :use http proxy, see udocker pull --help
+        -d, --detach               :run in background (Rn modes, runc/crun)
 
         Only available in Rn execution modes:
         --device=/dev/xxx          :pass device to container (R1 mode only)
@@ -988,6 +950,7 @@ class UdockerCLI(object):
         container and only pull/create if the <container-name> does not exist.
         """
         self._get_run_options(cmdp)
+        detach = cmdp.get("-d") or cmdp.get("--detach")
         container_or_image = cmdp.get("P1")
         Config.conf['location'] = cmdp.get("--location=")
         delete = cmdp.get("--rm")
@@ -1040,6 +1003,9 @@ class UdockerCLI(object):
         container_dir = ""
         if not Config.conf['location']:
             container_dir = self.localrepo.cd_container(container_id)
+        if detach:
+            return self._run_detached(container_id, container_dir,
+                                      container_or_image, exec_mode, delete)
         forwarder = self._start_port_forwarder(exec_engine, exec_mode)
         if forwarder is False:
             Msg().err("Error: cannot publish container ports")
@@ -1059,6 +1025,266 @@ class UdockerCLI(object):
             self.localrepo.del_container(container_id)
 
         return exit_status
+
+    def _detach_argv(self, container_id, container_or_image):
+        """Build the monitor command line from this invocation"""
+        cleaned = []
+        skip_next = False
+        for arg in list(sys.argv):
+            if skip_next:
+                skip_next = False
+                continue
+            if arg in ("-d", "--detach"):
+                continue
+            if arg == "--name":
+                skip_next = True
+                continue
+            if arg.startswith("--name="):
+                continue
+            cleaned.append(arg)
+        if not cleaned:
+            return []
+        rest = cleaned[1:]
+        try:
+            run_index = rest.index("run")
+        except ValueError:
+            return []
+        if "--nobanner" not in rest:
+            rest.insert(run_index + 1, "--nobanner")
+        if container_or_image:
+            for position in range(run_index + 1, len(rest)):
+                if rest[position] == container_or_image:
+                    rest[position] = container_id
+                    break
+        return rest
+
+    def _run_detached(self, container_id, container_dir,
+                      container_or_image, exec_mode, delete):
+        """Start a container in the background under the runc supervisor"""
+        mode = exec_mode.get_mode()
+        if not (isinstance(mode, str) and mode.startswith("R")):
+            Msg().err("Error: -d requires an Rn execution mode (runc/crun)")
+            return self.STATUS_ERROR
+        if delete:
+            Msg().err("Error: --rm cannot be combined with -d")
+            return self.STATUS_ERROR
+        if self.localrepo.iswriteable_container(container_id) != 1:
+            Msg().err("Error: container is not writable")
+            return self.STATUS_ERROR
+        argv = self._detach_argv(container_id, container_or_image)
+        if not argv:
+            Msg().err("Error: cannot build the supervisor command line")
+            return self.STATUS_ERROR
+        if not supervisor.spawn(container_id, container_dir, argv):
+            return self.STATUS_ERROR
+        Msg().out(container_id)
+        return self.STATUS_OK
+
+    def _runc_engine(self, container_id):
+        """Return the runc engine and its executable for a container"""
+        exec_mode = ExecutionMode(self.localrepo, container_id)
+        mode = exec_mode.get_mode()
+        if not (isinstance(mode, str) and mode.startswith("R")):
+            Msg().err("Error: this command requires an Rn execution mode")
+            return (None, "")
+        engine = exec_mode.get_engine()
+        if not engine or not hasattr(engine, "select_runc"):
+            Msg().err("Error: runc/crun engine not available")
+            return (None, "")
+        engine.select_runc()
+        return (engine, engine.executable)
+
+    def _resolve_container(self, arg):
+        """Resolve a container id or name, print an error if missing"""
+        if not arg:
+            Msg().err("Error: must specify a container")
+            return ""
+        container_id = self.localrepo.get_container_id(arg)
+        if not container_id:
+            Msg().err("Error: container not found:", arg)
+        return container_id
+
+    def _stop_container(self, container_id, timeout):
+        """Stop a container using runc/crun"""
+        (engine, executable) = self._runc_engine(container_id)
+        if not executable:
+            return self.STATUS_ERROR
+        container_dir = self.localrepo.cd_container(container_id)
+        if supervisor.stop(container_dir, executable, timeout,
+                           Config.conf['topdir']) != 0:
+            Msg().err("Error: cannot stop container")
+            return self.STATUS_ERROR
+        return self.STATUS_OK
+
+    def do_start(self, cmdp):
+        """
+        start: start a container that was created with run -d
+        start <container-id-or-name>
+        """
+        container_id = self._resolve_container(cmdp.get("P1"))
+        if cmdp.missing_options() or not container_id:
+            return self.STATUS_ERROR
+        container_dir = self.localrepo.cd_container(container_id)
+        conf = supervisor.read_conf(container_dir)
+        if not conf.get("argv"):
+            Msg().err("Error: container was not started with -d")
+            return self.STATUS_ERROR
+        if supervisor.is_running(container_dir):
+            Msg().err("Error: container is already running")
+            return self.STATUS_ERROR
+        (engine, executable) = self._runc_engine(container_id)
+        if not executable:
+            return self.STATUS_ERROR
+        if not supervisor.spawn(container_id, container_dir,
+                                conf["argv"], truncate=False):
+            return self.STATUS_ERROR
+        Msg().out(container_id)
+        return self.STATUS_OK
+
+    def do_stop(self, cmdp):
+        """
+        stop: stop a running container
+        stop [options] <container-id-or-name>
+        -t, --time=<seconds>       :seconds to wait before killing (default 10)
+        """
+        timeout = cmdp.get("-t=") or cmdp.get("--time=") or 10
+        container_id = self._resolve_container(cmdp.get("P1"))
+        if cmdp.missing_options() or not container_id:
+            return self.STATUS_ERROR
+        container_dir = self.localrepo.cd_container(container_id)
+        if not supervisor.is_running(container_dir):
+            Msg().out("Info: container is not running", container_id,
+                      l=Msg.INF)
+            return self.STATUS_OK
+        if self._stop_container(container_id, timeout) != 0:
+            return self.STATUS_ERROR
+        Msg().out(container_id)
+        return self.STATUS_OK
+
+    def do_restart(self, cmdp):
+        """
+        restart: stop and start a container created with run -d
+        restart [options] <container-id-or-name>
+        -t, --time=<seconds>       :seconds to wait before killing (default 10)
+        """
+        timeout = cmdp.get("-t=") or cmdp.get("--time=") or 10
+        container_id = self._resolve_container(cmdp.get("P1"))
+        if cmdp.missing_options() or not container_id:
+            return self.STATUS_ERROR
+        container_dir = self.localrepo.cd_container(container_id)
+        conf = supervisor.read_conf(container_dir)
+        if not conf.get("argv"):
+            Msg().err("Error: container was not started with -d")
+            return self.STATUS_ERROR
+        (engine, executable) = self._runc_engine(container_id)
+        if not executable:
+            return self.STATUS_ERROR
+        if supervisor.is_running(container_dir):
+            if self._stop_container(container_id, timeout) != 0:
+                return self.STATUS_ERROR
+        if not supervisor.spawn(container_id, container_dir,
+                                conf["argv"], truncate=False):
+            return self.STATUS_ERROR
+        Msg().out(container_id)
+        return self.STATUS_OK
+
+    def do_kill(self, cmdp):
+        """
+        kill: send a signal to a running container
+        kill [options] <container-id-or-name>
+        -s, --signal=<signal>      :signal to send (default KILL)
+        """
+        sig = cmdp.get("-s=") or cmdp.get("--signal=") or "KILL"
+        container_id = self._resolve_container(cmdp.get("P1"))
+        if cmdp.missing_options() or not container_id:
+            return self.STATUS_ERROR
+        container_dir = self.localrepo.cd_container(container_id)
+        if not supervisor.is_running(container_dir):
+            Msg().err("Error: container is not running")
+            return self.STATUS_ERROR
+        (engine, executable) = self._runc_engine(container_id)
+        if not executable:
+            return self.STATUS_ERROR
+        if supervisor.kill(container_dir, executable, sig,
+                           Config.conf['topdir']) != 0:
+            Msg().err("Error: cannot signal container")
+            return self.STATUS_ERROR
+        Msg().out(container_id)
+        return self.STATUS_OK
+
+    def do_exec(self, cmdp):
+        """
+        exec: execute a command inside a running container
+        exec [options] <container-id-or-name> <command> [args]
+        -u, --user=<user>          :run as user or uid[:gid]
+        -w, --workdir=<dir>        :working directory in the container
+        -e, --env=<VAR=VALUE>      :set environment variable (repeatable)
+        -t                         :allocate a tty
+        """
+        cmdp.declare_options("-u= -w= -e= -t -i")
+        user = cmdp.get("-u=") or cmdp.get("--user=")
+        workdir = cmdp.get("-w=") or cmdp.get("--workdir=")
+        env_vars = cmdp.get("-e=", "CMD_OPT", True)
+        env_vars.extend(cmdp.get("--env=", "CMD_OPT", True))
+        tty = bool(cmdp.get("-t")) and sys.stdout.isatty()
+        cmdp.get("-i")
+        container_id = self._resolve_container(cmdp.get("P1"))
+        command = cmdp.get("P+")
+        if cmdp.missing_options() or not container_id:
+            return self.STATUS_ERROR
+        if not command:
+            Msg().err("Error: must specify a command to execute")
+            return self.STATUS_ERROR
+        container_dir = self.localrepo.cd_container(container_id)
+        if not supervisor.is_running(container_dir):
+            Msg().err("Error: container is not running")
+            return self.STATUS_ERROR
+        (engine, executable) = self._runc_engine(container_id)
+        if not executable:
+            return self.STATUS_ERROR
+        run_user = ""
+        if user:
+            run_user = supervisor.resolve_user(container_dir, user)
+            if not run_user:
+                Msg().err("Error: user not found in container:", user)
+                return self.STATUS_ERROR
+        return supervisor.exec_command(
+            container_dir, executable, command, user=run_user,
+            workdir=workdir, env_vars=env_vars, tty=tty,
+            topdir=Config.conf['topdir'])
+
+    def do_logs(self, cmdp):
+        """
+        logs: print the stdout/stderr log of a container started with -d
+        logs [options] <container-id-or-name>
+        -f, --follow               :follow log output
+        --tail=<lines>             :number of lines from the end
+        """
+        follow = cmdp.get("-f") or cmdp.get("--follow")
+        tail = cmdp.get("--tail=")
+        container_id = self._resolve_container(cmdp.get("P1"))
+        if cmdp.missing_options() or not container_id:
+            return self.STATUS_ERROR
+        container_dir = self.localrepo.cd_container(container_id)
+        return supervisor.logs(container_dir, follow, tail)
+
+    def do_wait(self, cmdp):
+        """
+        wait: wait for a container to stop and print its exit code
+        wait [options] <container-id-or-name>
+        --timeout=<seconds>        :give up after this timeout
+        """
+        timeout = cmdp.get("--timeout=")
+        container_id = self._resolve_container(cmdp.get("P1"))
+        if cmdp.missing_options() or not container_id:
+            return self.STATUS_ERROR
+        container_dir = self.localrepo.cd_container(container_id)
+        exitcode = supervisor.wait(container_dir, timeout)
+        if exitcode is None:
+            Msg().err("Error: timeout waiting for container")
+            return self.STATUS_ERROR
+        Msg().out(exitcode)
+        return self.STATUS_OK
 
     def do_images(self, cmdp):
         """
@@ -1219,6 +1445,17 @@ class UdockerCLI(object):
                 Msg().err("Error: container is protected")
                 exit_status = self.STATUS_ERROR
                 continue
+
+            container_dir = self.localrepo.cd_container(container_id)
+            if supervisor.is_running(container_dir):
+                if not force:
+                    Msg().err("Error: container is running, use -f to stop it")
+                    exit_status = self.STATUS_ERROR
+                    continue
+                (engine, executable) = self._runc_engine(container_id)
+                if executable:
+                    supervisor.stop(container_dir, executable, 10,
+                                    Config.conf['topdir'])
 
             Msg().out("Info: deleting container:",
                       str(container_id), l=Msg.INF)
@@ -1977,6 +2214,14 @@ Commands:
   create <repo/image:tag>       :Create container from a pulled image
   run <container_id|name>       :Execute created container
   run <repo/image:tag>          :Pull, create and execute container
+  run -d <container>            :Execute container in background (Rn modes)
+  start <container>             :Start a container created with run -d
+  stop <container>              :Stop a running container
+  restart <container>           :Stop and start a container
+  kill -s <signal> <container>  :Send a signal to a running container
+  exec <container> <command>    :Execute a command in a running container
+  logs [-f] <container>         :Show the log of a container
+  wait <container>              :Wait for a container and print its exit code
   build -t <repo/image:tag> <path> :Build image from a Dockerfile
   commit <container> <repo/image:tag> :Create an image from a container
 
