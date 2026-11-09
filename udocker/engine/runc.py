@@ -471,5 +471,9 @@ class RuncEngine(ExecutionEngineCommon):
             status.terminate()
         except OSError:
             pass
+        try:
+            status.wait()
+        except OSError:
+            pass
         self._filebind.finish()
-        return status
+        return status.returncode

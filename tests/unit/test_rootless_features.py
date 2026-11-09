@@ -216,7 +216,7 @@ class RootlessFeaturesTestCase(TestCase):
             base, state={"status": "exited", "exitcode": 0})
         localrepo = Mock()
         localrepo.get_containers_list.return_value = [
-            ("CID", "mycontainer", "myimage:latest")]
+            ("CID", "myimage:latest", ["mycontainer"])]
         localrepo.cd_container.return_value = container_dir
         localrepo.isprotected_container.return_value = False
         localrepo.iswriteable_container.return_value = 1
@@ -237,6 +237,8 @@ class RootlessFeaturesTestCase(TestCase):
         self.assertEqual(data[0]["container_id"], "CID")
         self.assertEqual(data[0]["status"], "Exited (0)")
         self.assertEqual(data[0]["mode"], "P1")
+        self.assertEqual(data[0]["image"], "myimage:latest")
+        self.assertEqual(data[0]["name"], "mycontainer")
 
     def test_10_images_json(self):
         """Test10 images --format=json emits the image list as JSON"""

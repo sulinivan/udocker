@@ -1138,12 +1138,14 @@ class UdockerCLI(object):
             return self.STATUS_ERROR
 
         containers = []
-        for (container_id, name, image) in \
+        for (container_id, image, names) in \
                 self.localrepo.get_containers_list(False):
             container_dir = self.localrepo.cd_container(container_id) or ""
+            if isinstance(names, (list, tuple)):
+                names = ",".join(names)
             containers.append({
                 "container_id": container_id,
-                "name": name,
+                "name": names,
                 "image": image,
                 "mode": ExecutionMode(self.localrepo,
                                       container_id).get_mode(),

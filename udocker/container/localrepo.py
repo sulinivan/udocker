@@ -188,8 +188,8 @@ class LocalRepository(object):
                 elif not os.path.islink(container_dir):
                     names = self.get_container_name(fname)
                     if not names:
-                        names = ""
-                    containers_list.append((fname, reponame, str(names)))
+                        names = []
+                    containers_list.append((fname, reponame, names))
         return containers_list
 
     def del_container(self, container_id, force=False):
