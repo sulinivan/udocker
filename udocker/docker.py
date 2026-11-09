@@ -4,8 +4,24 @@
 import os
 import sys
 import re
+import gzip
 import base64
+import hashlib
 import json
+
+try:
+    import ssl
+except ImportError:
+    ssl = None
+
+try:
+    from urllib.request import Request, build_opener, HTTPSHandler
+    from urllib.error import HTTPError, URLError
+    from urllib.parse import urljoin, quote
+except ImportError:
+    from urllib2 import Request, build_opener, HTTPSHandler, HTTPError, URLError
+    from urlparse import urljoin
+    from urllib import quote
 
 from udocker.config import Config
 from udocker.msg import Msg
@@ -15,6 +31,249 @@ from udocker.utils.fileutil import FileUtil
 from udocker.utils.curl import GetURL
 from udocker.utils.chksum import ChkSUM
 from udocker.helper.hostinfo import HostInfo
+
+
+class _MethodRequest(Request):
+    """urllib Request with an explicit method on Python 2 and 3"""
+
+    def __init__(self, url, data=None, headers=None, method=None):
+        Request.__init__(self, url, data=data, headers=headers or {})
+        self._method = method
+
+    def get_method(self):
+        """Return the explicitly requested HTTP method"""
+        if self._method:
+            return self._method
+        return Request.get_method(self)
+
+
+class RegistryUploader(object):
+    """Docker Registry HTTP API v2 uploader.
+    Uses only the Python standard library and needs no privileges.
+    """
+
+    MANIFEST_TYPE = "application/vnd.docker.distribution.manifest.v2+json"
+    CONFIG_TYPE = "application/vnd.docker.container.image.v1+json"
+    LAYER_TAR = "application/vnd.docker.image.rootfs.diff.tar"
+    LAYER_TAR_GZ = "application/vnd.docker.image.rootfs.diff.tar.gzip"
+
+    def __init__(self, registry_url, auth_token, insecure=False):
+        self.registry_url = str(registry_url).rstrip("/")
+        self.auth_token = auth_token
+        self.insecure = insecure
+        self.timeout = Config.conf['timeout']
+
+    def _open(self, request, timeout=None):
+        """Open a request honouring the insecure TLS setting"""
+        if timeout is None:
+            timeout = self.timeout
+        handlers = []
+        if self.insecure and ssl is not None:
+            try:
+                context = ssl._create_unverified_context()
+                handlers.append(HTTPSHandler(context=context))
+            except AttributeError:
+                pass
+        opener = build_opener(*handlers)
+        return opener.open(request, timeout=timeout)
+
+    @staticmethod
+    def _response(response):
+        """Read status, headers and body from a response object"""
+        code = getattr(response, "getcode", lambda: 0)()
+        if not code:
+            code = getattr(response, "code", 0)
+        headers = {}
+        try:
+            for (key, value) in response.headers.items():
+                headers[key.lower()] = value
+        except AttributeError:
+            pass
+        body = response.read()
+        try:
+            response.close()
+        except AttributeError:
+            pass
+        return (code, headers, body)
+
+    def _request(self, method, url, data=None, size=None, headers=None):
+        """Perform an HTTP request and return (code, headers, body)"""
+        request = _MethodRequest(url, data=data, headers=headers or {},
+                                 method=method)
+        if size is not None:
+            request.add_header("Content-Length", str(size))
+        try:
+            response = self._open(request)
+        except HTTPError as error:
+            return self._response(error)
+        except (URLError, IOError, OSError) as error:
+            Msg().err("Error: registry request failed:", str(error))
+            return (0, {}, b"")
+        return self._response(response)
+
+    def auth_header(self, remoterepo):
+        """Obtain an Authorization header value with push scope"""
+        (code, headers, dummy) = self._request(
+            "GET", self.registry_url + "/v2/")
+        challenge = headers.get("www-authenticate", "")
+        if code == 200 or "realm" not in challenge:
+            return ""
+        if challenge.lower().startswith("basic"):
+            return "Basic " + self.auth_token if self.auth_token else ""
+        (dummy, auth_data) = challenge.rsplit(" ", 1)
+        fields = {}
+        for field in auth_data.split(","):
+            pair = field.split("=", 1)
+            if len(pair) == 2:
+                fields[pair[0].strip()] = pair[1].strip().strip('"')
+        realm = fields.get("realm", "")
+        if not realm:
+            return ""
+        url = realm + "?scope=repository:" + quote(remoterepo) + ":pull,push"
+        if fields.get("service"):
+            url += "&service=" + quote(fields["service"])
+        request = _MethodRequest(url, method="GET")
+        if self.auth_token:
+            request.add_header("Authorization", "Basic " + self.auth_token)
+        try:
+            response = self._open(request, timeout=30)
+        except HTTPError as error:
+            Msg().err("Error: registry authentication failed:",
+                      str(error.code))
+            return ""
+        except (URLError, IOError, OSError) as error:
+            Msg().err("Error: registry authentication failed:", str(error))
+            return ""
+        (dummy, dummy, body) = self._response(response)
+        token = {}
+        try:
+            token = json.loads(body.decode())
+        except (ValueError, AttributeError):
+            pass
+        token = token.get("token") or token.get("access_token") or ""
+        return "Bearer " + token if token else ""
+
+    def blob_exists(self, remoterepo, digest, auth):
+        """Check whether a blob is already present in the registry"""
+        headers = {}
+        if auth:
+            headers["Authorization"] = auth
+        (code, dummy, dummy) = self._request(
+            "HEAD",
+            self.registry_url + "/v2/" + remoterepo + "/blobs/" + digest,
+            headers=headers)
+        return code == 200
+
+    def upload_blob(self, remoterepo, digest, auth,
+                    filename=None, data=None):
+        """Upload a layer or config blob using the chunked upload API"""
+        if filename is not None:
+            size = FileUtil(filename).size()
+            data = open(filename, "rb")
+        else:
+            size = len(data)
+        try:
+            headers = {}
+            if auth:
+                headers["Authorization"] = auth
+            (code, resp_headers, dummy) = self._request(
+                "POST",
+                self.registry_url + "/v2/" + remoterepo + "/blobs/uploads/",
+                headers=headers)
+            if code not in (201, 202):
+                Msg().err("Error: starting blob upload:", code)
+                return False
+            location = resp_headers.get("location", "")
+            if not location:
+                Msg().err("Error: blob upload location missing")
+                return False
+            location = urljoin(self.registry_url + "/", location)
+
+            headers = {"Content-Type": "application/octet-stream"}
+            if auth:
+                headers["Authorization"] = auth
+            (code, resp_headers, dummy) = self._request(
+                "PATCH", location, data=data, size=size, headers=headers)
+            if code not in (201, 202):
+                Msg().err("Error: uploading blob data:", code)
+                return False
+            location = resp_headers.get("location", "") or location
+            location = urljoin(self.registry_url + "/", location)
+
+            separator = "&" if "?" in location else "?"
+            headers = {}
+            if auth:
+                headers["Authorization"] = auth
+            (code, dummy, body) = self._request(
+                "PUT", location + separator + "digest=" + quote(digest),
+                headers=headers)
+            if code not in (201, 202):
+                Msg().err("Error: completing blob upload:", code,
+                          str(body)[:200])
+                return False
+            return True
+        finally:
+            if filename is not None:
+                data.close()
+
+    def put_manifest(self, remoterepo, tag, manifest, auth):
+        """Upload the image manifest"""
+        data = json.dumps(manifest).encode("utf-8")
+        headers = {"Content-Type": self.MANIFEST_TYPE}
+        if auth:
+            headers["Authorization"] = auth
+        (code, dummy, body) = self._request(
+            "PUT",
+            self.registry_url + "/v2/" + remoterepo + "/manifests/" + tag,
+            data=data, size=len(data), headers=headers)
+        if code not in (201, 202):
+            Msg().err("Error: uploading manifest:", code, str(body)[:200])
+            return False
+        return True
+
+    @staticmethod
+    def layer_media_type(filename):
+        """Return the media type of a layer tar, gzip or plain"""
+        try:
+            with open(filename, "rb") as filep:
+                magic = filep.read(2)
+        except (IOError, OSError):
+            return RegistryUploader.LAYER_TAR
+        if magic == b"\x1f\x8b":
+            return RegistryUploader.LAYER_TAR_GZ
+        return RegistryUploader.LAYER_TAR
+
+    @staticmethod
+    def file_digest(filename):
+        """Return the sha256 digest of a file"""
+        digest = hashlib.sha256()
+        with open(filename, "rb") as filep:
+            while True:
+                chunk = filep.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return "sha256:" + digest.hexdigest()
+
+    @staticmethod
+    def diff_id(filename):
+        """Return the uncompressed sha256 digest of a layer file"""
+        digest = hashlib.sha256()
+        with open(filename, "rb") as filep:
+            magic = filep.read(2)
+        if magic == b"\x1f\x8b":
+            filep = gzip.open(filename, "rb")
+        else:
+            filep = open(filename, "rb")
+        try:
+            while True:
+                chunk = filep.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        finally:
+            filep.close()
+        return "sha256:" + digest.hexdigest()
 
 
 class DockerIoAPI(object):
@@ -56,7 +315,9 @@ class DockerIoAPI(object):
     # ARCHNEW
     def is_layer_name(self, layername):
         """Check if name matches authorized characters for a docker layer"""
-        if layername and re.match("^[a-zA-Z0-9]+@[a-z0-9]+:[a-z0-9]+$", layername):
+        if layername and re.match(
+                "^[a-zA-Z0-9][a-zA-Z0-9-_./]*"
+                "@sha256:[a-f0-9]{64}$", layername):
             return True
         return False
 
@@ -630,6 +891,71 @@ class DockerIoAPI(object):
         if self.is_v2():
             return self.get_v2_image_tags(remoterepo, True)  # try v2
         return self.get_v1_image_tags(remoterepo, True)  # try v1
+
+    def push(self, imagerepo, tag):
+        """Push a locally stored image to a docker registry v2.
+        Needs no privileges, only network access and optional credentials.
+        """
+        (imagerepo, remoterepo) = self._parse_imagerepo(imagerepo)
+        if not self.localrepo.cd_imagerepo(imagerepo, tag):
+            Msg().err("Error: image not found:", imagerepo + ":" + tag)
+            return False
+        (container_json, layer_files) = self.localrepo.get_image_attributes()
+        if not container_json or not layer_files:
+            Msg().err("Error: image layers or metadata not found")
+            return False
+
+        uploader = RegistryUploader(self.registry_url, self.v2_auth_token,
+                                    Config.conf['http_insecure'])
+        auth = uploader.auth_header(remoterepo)
+        if not auth:
+            Msg().out("Warning: pushing without registry authentication",
+                      l=Msg.WAR)
+
+        layers = []
+        diff_ids = []
+        for layer_file in layer_files:
+            layer_digest = uploader.file_digest(layer_file)
+            diff_ids.append(uploader.diff_id(layer_file))
+            layers.append({
+                "mediaType": uploader.layer_media_type(layer_file),
+                "size": FileUtil(layer_file).size(),
+                "digest": layer_digest,
+            })
+            if uploader.blob_exists(remoterepo, layer_digest, auth):
+                Msg().out("Info: layer already present:", layer_digest,
+                          l=Msg.INF)
+                continue
+            Msg().out("Info: pushing layer:", layer_digest, l=Msg.INF)
+            if not uploader.upload_blob(remoterepo, layer_digest, auth,
+                                        filename=layer_file):
+                return False
+
+        container_json = dict(container_json)
+        rootfs = dict(container_json.get("rootfs") or {})
+        rootfs["type"] = "layers"
+        rootfs["diff_ids"] = diff_ids
+        container_json["rootfs"] = rootfs
+        config_data = json.dumps(container_json).encode("utf-8")
+        config_digest = "sha256:" + hashlib.sha256(config_data).hexdigest()
+        if not uploader.blob_exists(remoterepo, config_digest, auth):
+            Msg().out("Info: pushing image config:", config_digest, l=Msg.INF)
+            if not uploader.upload_blob(remoterepo, config_digest, auth,
+                                        data=config_data):
+                return False
+
+        manifest = {
+            "schemaVersion": 2,
+            "mediaType": uploader.MANIFEST_TYPE,
+            "config": {
+                "mediaType": uploader.CONFIG_TYPE,
+                "size": len(config_data),
+                "digest": config_digest,
+            },
+            "layers": layers,
+        }
+        Msg().out("Info: pushing manifest:", imagerepo + ":" + tag, l=Msg.INF)
+        return uploader.put_manifest(remoterepo, tag, manifest, auth)
 
     def search_init(self, pause):
         """Setup new search"""
