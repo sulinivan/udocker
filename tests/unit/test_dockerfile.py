@@ -319,8 +319,11 @@ class ContainerBuilderTestCase(TestCase):
         self.mock_lrepo.setup_tag.return_value = True
         self.mock_lrepo.set_version.return_value = True
         self.mock_lrepo.save_json.return_value = True
-        status = builder.commit("myrepo/myimage", "latest")
+        status = builder.commit("myrepo/myimage", "latest",
+                                message="commit message", author="someone")
         self.assertTrue(status)
+        self.assertEqual(builder.container_json["comment"], "commit message")
+        self.assertEqual(builder.container_json["author"], "someone")
         self.mock_lrepo.setup_imagerepo.assert_called_with("myrepo/myimage")
         self.mock_lrepo.add_image_layer.assert_any_call(
             "/layers/LAYERID.layer")

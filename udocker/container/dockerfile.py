@@ -698,7 +698,7 @@ class ContainerBuilder(object):
             return False
         return True
 
-    def commit(self, imagerepo, tag):
+    def commit(self, imagerepo, tag, message=None, author=None):
         """Create a new local image from the current container filesystem
         and accumulated metadata"""
         self.localrepo.setup_imagerepo(imagerepo)
@@ -717,7 +717,9 @@ class ContainerBuilder(object):
         self.localrepo.add_image_layer(layer_file)
         self.localrepo.save_json("ancestry", [layer_id])
         self.container_json["id"] = layer_id
-        self.container_json["comment"] = "created by udocker build"
+        self.container_json["comment"] = message or "created by udocker build"
+        if author:
+            self.container_json["author"] = author
         self.container_json["created"] = \
             time.strftime("%Y-%m-%dT%H:%M:%S.000000000Z")
         if not self.container_json.get("architecture"):

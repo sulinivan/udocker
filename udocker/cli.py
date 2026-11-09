@@ -5,6 +5,8 @@ import os
 import sys
 import string
 import json
+import shutil
+import time
 from getpass import getpass
 
 from udocker import __version__
@@ -23,6 +25,7 @@ from udocker.tools import UdockerTools
 from udocker.utils.fileutil import FileUtil
 from udocker.utils.filebind import FileBind
 from udocker.utils.mountpoint import MountPoint
+from udocker.utils.portforward import PortForwarder
 
 # if Python 3
 if sys.version_info[0] >= 3:
@@ -164,6 +167,186 @@ class UdockerCLI(object):
         if ':' in image:
             (image, tag) = image.split(':', 1)
         return (transport, hostname, image, tag)
+
+    @staticmethod
+    def _container_realpath(container_root, path, follow_final=True):
+        """Resolve a path inside the container ROOT without escaping it.
+        Absolute symlinks are interpreted relative to the container root,
+        as they are when the container executes. The final path component
+        is followed only if follow_final is True. Returns None when the
+        resolved path would escape the container root.
+        """
+        root = os.path.realpath(container_root)
+        parts = [part for part in str(path).split("/")
+                 if part not in ("", ".")]
+        current = root
+        hops = 0
+        while parts:
+            part = parts.pop(0)
+            if not parts and not follow_final:
+                current = os.path.join(current, part)
+                break
+            if part == "..":
+                parent = os.path.dirname(current)
+                if parent != root and not parent.startswith(root + os.sep):
+                    return None
+                current = parent
+                continue
+            candidate = os.path.join(current, part)
+            if os.path.islink(candidate):
+                hops += 1
+                if hops > 40:
+                    return None
+                link = os.readlink(candidate)
+                if link.startswith("/"):
+                    current = root
+                parts = [item for item in link.split("/")
+                         if item not in ("", ".")] + parts
+                continue
+            current = candidate
+        current = os.path.normpath(current)
+        if current != root and not current.startswith(root + os.sep):
+            return None
+        if not follow_final:
+            return current
+        real = os.path.realpath(current)
+        if real != root and not real.startswith(root + os.sep):
+            return None
+        return real
+
+    def _parse_cp_arg(self, arg):
+        """Split a cp argument into (container_id, path).
+        Returns (None, arg) when the argument is a host path."""
+        if not arg:
+            return (None, "")
+        if ":" in arg:
+            (ref, path) = arg.split(":", 1)
+            container_id = self.localrepo.get_container_id(ref)
+            if container_id:
+                return (container_id, path)
+        return (None, arg)
+
+    @staticmethod
+    def _copy_tree(src, dst):
+        """Recursively copy src into dst preserving modes and symlinks"""
+        if os.path.exists(dst) and not os.path.isdir(dst):
+            return False
+        try:
+            if not os.path.isdir(dst):
+                os.makedirs(dst)
+            for name in os.listdir(src):
+                srcname = os.path.join(src, name)
+                dstname = os.path.join(dst, name)
+                if os.path.islink(srcname):
+                    if os.path.lexists(dstname):
+                        os.unlink(dstname)
+                    os.symlink(os.readlink(srcname), dstname)
+                elif os.path.isdir(srcname):
+                    if not UdockerCLI._copy_tree(srcname, dstname):
+                        return False
+                else:
+                    shutil.copy2(srcname, dstname)
+        except (IOError, OSError):
+            return False
+        try:
+            shutil.copystat(src, dst)
+        except (IOError, OSError):
+            pass
+        return True
+
+    @staticmethod
+    def _copy_path(src, dst):
+        """Copy one file, symlink or directory tree to dst"""
+        if not os.path.lexists(src):
+            return False
+        if os.path.islink(src):
+            try:
+                if os.path.lexists(dst):
+                    os.unlink(dst)
+                os.symlink(os.readlink(src), dst)
+            except (IOError, OSError):
+                return False
+            return True
+        if os.path.isdir(src):
+            return UdockerCLI._copy_tree(src, dst)
+        try:
+            parent = os.path.dirname(dst)
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent)
+            shutil.copy2(src, dst)
+        except (IOError, OSError):
+            return False
+        return True
+
+    @staticmethod
+    def _write_state(container_dir, status, exitcode=None):
+        """Record the execution state of a container for ps"""
+        if not isinstance(container_dir, (str, bytes)):
+            return
+        state = {"status": status,
+                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                            time.gmtime())}
+        if status == "running":
+            state["pid"] = os.getpid()
+        if exitcode is not None:
+            state["exitcode"] = exitcode
+        try:
+            with open(container_dir + "/state.json", "w") as filep:
+                json.dump(state, filep)
+        except (IOError, OSError, ValueError, TypeError):
+            pass
+
+    @staticmethod
+    def _container_status(container_dir):
+        """Compute the docker-like status of a container"""
+        if not isinstance(container_dir, (str, bytes)):
+            return "Created"
+        try:
+            with open(container_dir + "/state.json", "r") as filep:
+                state = json.load(filep)
+        except (IOError, OSError, ValueError, TypeError):
+            return "Created"
+        status = state.get("status", "")
+        if status == "running":
+            try:
+                os.kill(int(state.get("pid", 0)), 0)
+            except (OSError, ValueError, TypeError):
+                return "Interrupted"
+            return "Running"
+        if status == "exited":
+            return "Exited (%s)" % state.get("exitcode", "?")
+        if status == "interrupted":
+            return "Interrupted"
+        return "Created"
+
+    @staticmethod
+    def _start_port_forwarder(exec_engine, exec_mode):
+        """Publish container ports where PRoot does not do it.
+        F, R and S modes share the host network namespace, so a userspace
+        TCP forwarder is enough and requires no privileges.
+        Returns a started PortForwarder, None when nothing to do, or
+        False on a malformed mapping.
+        """
+        if not isinstance(getattr(exec_engine, "opt", None), dict):
+            return None
+        portsmap = exec_engine.opt.get("portsmap") or []
+        if not portsmap:
+            return None
+        mode = exec_mode.get_mode() if exec_mode else ""
+        if isinstance(mode, str) and mode.startswith("P"):
+            return None
+        forwarder = PortForwarder()
+        for mapping in portsmap:
+            try:
+                (host_port, container_port) = str(mapping).split(":", 1)
+            except ValueError:
+                Msg().err("Error: invalid port mapping:", mapping)
+                return False
+            if not forwarder.add(host_port, container_port):
+                forwarder.stop()
+                return False
+        forwarder.start()
+        return forwarder
 
     def do_mkrepo(self, cmdp):
         """
@@ -570,6 +753,31 @@ class UdockerCLI(object):
         Msg().err("Error: no files downloaded")
         return self.STATUS_ERROR
 
+    def do_push(self, cmdp):
+        """
+        push: upload an image to a docker registry
+        push [options] <repo/image:tag>
+        --registry=<url>          :registry url e.g. quay.io
+        --index=<url>             :docker index url
+        --httpproxy=<proxy>       :use http proxy for registry access
+        """
+        index_url = cmdp.get("--index=")
+        registry_url = cmdp.get("--registry=")
+        http_proxy = cmdp.get("--httpproxy=")
+        (imagerepo, tag) = self._check_imagespec(cmdp.get("P1"))
+        if (not imagerepo) or cmdp.missing_options():    # syntax error
+            return self.STATUS_ERROR
+
+        self._set_repository(registry_url, index_url, imagerepo, http_proxy)
+        v2_auth_token = self.keystore.get(self.dockerioapi.registry_url)
+        self.dockerioapi.set_v2_login_token(v2_auth_token)
+        if self.dockerioapi.push(imagerepo, tag):
+            Msg().out("Info: image pushed:", imagerepo + ":" + tag, l=Msg.INF)
+            return self.STATUS_OK
+
+        Msg().err("Error: pushing image")
+        return self.STATUS_ERROR
+
     def _create(self, imagespec):
         """Auxiliary to create(), performs the creation"""
         if not self.dockerioapi.is_repo_name(imagespec):
@@ -765,9 +973,11 @@ class UdockerCLI(object):
         Only available in Rn execution modes:
         --device=/dev/xxx          :pass device to container (R1 mode only)
 
-        Only available in Pn execution modes:
+        Port publishing:
         --publish=<hport:cport>    :map container TCP/IP <cport> into <hport>
-        --publish-all              :bind and connect to random ports
+        --publish-all              :bind and connect to random ports (Pn only)
+        In Pn modes publishing is done by PRoot, in Fn/Rn/Sn modes -p is
+        implemented with a userspace TCP forwarder (no privileges needed).
 
         run <container-id-or-name> executes an existing container, previously
         created from an image by using: create <repo/image:tag>
@@ -827,7 +1037,24 @@ class UdockerCLI(object):
             return self.STATUS_ERROR
 
         self._get_run_options(cmdp, exec_engine)
-        exit_status = exec_engine.run(container_id)
+        container_dir = ""
+        if not Config.conf['location']:
+            container_dir = self.localrepo.cd_container(container_id)
+        forwarder = self._start_port_forwarder(exec_engine, exec_mode)
+        if forwarder is False:
+            Msg().err("Error: cannot publish container ports")
+            return self.STATUS_ERROR
+        self._write_state(container_dir, "running")
+        try:
+            exit_status = exec_engine.run(container_id)
+        except BaseException:
+            if forwarder:
+                forwarder.stop()
+            self._write_state(container_dir, "interrupted")
+            raise
+        if forwarder:
+            forwarder.stop()
+        self._write_state(container_dir, "exited", exitcode=exit_status)
         if delete and not self.localrepo.isprotected_container(container_id):
             self.localrepo.del_container(container_id)
 
@@ -839,15 +1066,38 @@ class UdockerCLI(object):
         images [options]
         -l                         :long format
         -p                         :print platform
+        --format=json              :print the image list as JSON
         """
         verbose = cmdp.get("-l")
         print_platform = cmdp.get("-p")
+        output_format = cmdp.get("--format=")
         dummy = cmdp.get("--no-trunc")
         dummy = cmdp.get("--all")
         if cmdp.missing_options():               # syntax error
             return self.STATUS_ERROR
         images_list = self.localrepo.get_imagerepos()
+
+        if output_format == "json":
+            images_json = []
+            for (imagerepo, tag) in images_list:
+                self.localrepo.cd_imagerepo(imagerepo, tag)
+                size = 0
+                for (dummy, layer_size) in self.localrepo.get_layers(
+                        imagerepo, tag):
+                    size += layer_size
+                images_json.append({
+                    "repository": imagerepo,
+                    "tag": tag,
+                    "protected": bool(self.localrepo.isprotected_imagerepo(
+                        imagerepo, tag)),
+                    "platform": self.localrepo.get_image_platform_fmt(),
+                    "size": size,
+                })
+            Msg().out(json.dumps(images_json, sort_keys=True, indent=4))
+            return self.STATUS_OK
+
         Msg().out("REPOSITORY", l=Msg.INF)
+
         for (imagerepo, tag) in images_list:
             prot = (".", "P")[
                 self.localrepo.isprotected_imagerepo(imagerepo, tag)]
@@ -878,12 +1128,39 @@ class UdockerCLI(object):
         -m                         :print execution mode
         -s                         :print size in MB
         -p                         :print platform
+        --format=json              :print the container list as JSON
         """
         print_mode = cmdp.get("-m")
         print_size = cmdp.get("-s")
         print_platform = cmdp.get("-p")
+        output_format = cmdp.get("--format=")
         if cmdp.missing_options():               # syntax error
             return self.STATUS_ERROR
+
+        containers = []
+        for (container_id, name, image) in \
+                self.localrepo.get_containers_list(False):
+            container_dir = self.localrepo.cd_container(container_id) or ""
+            containers.append({
+                "container_id": container_id,
+                "name": name,
+                "image": image,
+                "mode": ExecutionMode(self.localrepo,
+                                      container_id).get_mode(),
+                "protected": bool(self.localrepo.isprotected_container(
+                    container_id)),
+                "writable": self.localrepo.iswriteable_container(container_id),
+                "size": self.localrepo.get_size(container_id),
+                "platform": ContainerStructure(
+                    self.localrepo,
+                    container_id).get_container_platform_fmt(),
+                "status": self._container_status(container_dir),
+            })
+
+        if output_format == "json":
+            Msg().out(json.dumps(containers, sort_keys=True, indent=4))
+            return self.STATUS_OK
+
         mod_h = size_h = plat_h = ""
         mod_l = size_l = plat_l = "%0s"
         if print_mode:
@@ -895,23 +1172,22 @@ class UdockerCLI(object):
         if print_platform:
             plat_h = "PLATFORM           "
             plat_l = "%-18.18s "
-        fmt = "%-36.36s %c %c " + mod_h + size_h + plat_h + "%-18s %-20.20s"
-        Msg().out(fmt % ("CONTAINER ID", 'P', 'M', "NAMES", "IMAGE"))
-        fmt = "%-36.36s %c %c " + mod_l + size_l + plat_l + "%-18.100s %-20.100s"
-        line = [''] * 8
-        containers_list = self.localrepo.get_containers_list(False)
-        for (line[0], line[7], line[6]) in containers_list:
-            container_id = line[0]
-            exec_mode = ExecutionMode(self.localrepo, container_id)
-            line[3] = exec_mode.get_mode() if print_mode else ""
-            line[1] = ('.', 'P')[
-                self.localrepo.isprotected_container(container_id)]
-            line[2] = ('R', 'W', 'N', 'D')[
-                self.localrepo.iswriteable_container(container_id)]
-            line[4] = self.localrepo.get_size(container_id) if print_size else ""
-            platform = ContainerStructure(self.localrepo,
-                                          container_id).get_container_platform_fmt()
-            line[5] = platform if print_platform else ""
+        fmt = ("%-36.36s %c %c " + mod_h + size_h + plat_h +
+               "%-12.12s %-18s %-20.20s")
+        Msg().out(fmt % ("CONTAINER ID", 'P', 'M', "STATUS", "NAMES", "IMAGE"))
+        fmt = ("%-36.36s %c %c " + mod_l + size_l + plat_l +
+               "%-12.100s %-18.100s %-20.100s")
+        for container in containers:
+            line = [''] * 9
+            line[0] = container["container_id"]
+            line[1] = ('.', 'P')[container["protected"]]
+            line[2] = ('R', 'W', 'N', 'D')[container["writable"]]
+            line[3] = container["mode"] if print_mode else ""
+            line[4] = container["size"] if print_size else ""
+            line[5] = container["platform"] if print_platform else ""
+            line[6] = container["status"]
+            line[7] = container["name"]
+            line[8] = container["image"]
             Msg().out(fmt % tuple(line))
         return self.STATUS_OK
 
@@ -1008,6 +1284,154 @@ class UdockerCLI(object):
             Msg().err("Error: deleting image")
             return self.STATUS_ERROR
 
+        return self.STATUS_OK
+
+    def do_commit(self, cmdp):
+        """
+        commit: create a new image from a container
+        commit [options] <container-id-or-name> <repo/image:tag>
+        -m, --message=<text>       :commit message
+        -a, --author=<text>        :author name
+        """
+        message = cmdp.get("-m=") or cmdp.get("--message=") or None
+        author = cmdp.get("-a=") or cmdp.get("--author=") or None
+        container_or_name = cmdp.get("P1")
+        imagespec = cmdp.get("P2")
+        if cmdp.missing_options():               # syntax error
+            return self.STATUS_ERROR
+        if not (container_or_name and imagespec):
+            Msg().err("Error: must specify container and repo/image:tag")
+            return self.STATUS_ERROR
+
+        container_id = self.localrepo.get_container_id(container_or_name)
+        if not container_id:
+            Msg().err("Error: container not found:", container_or_name)
+            return self.STATUS_ERROR
+
+        (imagerepo, tag) = self._check_imagespec(imagespec)
+        if not imagerepo:
+            return self.STATUS_ERROR
+        if self.localrepo.cd_imagerepo(imagerepo, tag):
+            if self.localrepo.isprotected_imagerepo(imagerepo, tag):
+                Msg().err("Error: image repository is protected")
+                return self.STATUS_ERROR
+            self.localrepo.del_imagerepo(imagerepo, tag, force=True)
+
+        builder = ContainerBuilder(self.localrepo, container_id)
+        if not builder.commit(imagerepo, tag, message=message, author=author):
+            Msg().err("Error: committing container")
+            return self.STATUS_ERROR
+
+        Msg().out("Info: image committed:", imagerepo + ":" + tag, l=Msg.INF)
+        return self.STATUS_OK
+
+    def do_history(self, cmdp):
+        """
+        history: show the layers of an image
+        history <repo/image:tag>
+        --no-trunc                 :do not truncate layer ids
+        """
+        imagespec = cmdp.get("P1")
+        no_trunc = cmdp.get("--no-trunc")
+        if cmdp.missing_options():               # syntax error
+            return self.STATUS_ERROR
+        (imagerepo, tag) = self._check_imagespec(imagespec)
+        if not imagerepo:
+            return self.STATUS_ERROR
+        if not self.localrepo.cd_imagerepo(imagerepo, tag):
+            Msg().err("Error: image not found:", imagespec)
+            return self.STATUS_ERROR
+
+        ancestry = self.localrepo.load_json("ancestry") or []
+        (container_json, dummy) = self.localrepo.get_image_attributes()
+        created = ""
+        comment = ""
+        if container_json:
+            created = container_json.get("created", "") or ""
+            comment = container_json.get("comment", "") or ""
+
+        layers = self.localrepo.get_layers(imagerepo, tag)
+        layers_map = {}
+        for (layer_path, layer_size) in layers:
+            layer_name = os.path.basename(layer_path)
+            if layer_name.endswith(".layer"):
+                layer_name = layer_name[:-len(".layer")]
+            layers_map[layer_name] = layer_size
+
+        layer_ids = [layer_id for layer_id in reversed(ancestry)
+                     if layer_id in layers_map]
+        if not layer_ids:
+            layer_ids = list(layers_map)
+
+        Msg().out("%-24s %-10s %-12s %s" %
+                  ("LAYER ID", "SIZE", "CREATED", "COMMENT"))
+        for position, layer_id in enumerate(layer_ids):
+            size_mb = layers_map.get(layer_id, 0) / (1024 * 1024)
+            layer_disp = layer_id if no_trunc else layer_id[:24]
+            created_row = created if position == 0 else ""
+            comment_row = comment if position == 0 else ""
+            Msg().out("%-24.24s %-10s %-12s %s" %
+                      (layer_disp, "%d MB" % size_mb,
+                       created_row[:12], comment_row))
+        return self.STATUS_OK
+
+    def do_cp(self, cmdp):
+        """
+        cp: copy files between the host and a container
+        cp <container-id-or-name>:<path> <host-path>
+        cp <host-path> <container-id-or-name>:<path>
+        """
+        src = cmdp.get("P1")
+        dst = cmdp.get("P2")
+        if cmdp.missing_options():               # syntax error
+            return self.STATUS_ERROR
+        if not (src and dst):
+            Msg().err("Error: must specify source and destination")
+            return self.STATUS_ERROR
+
+        (src_cid, src_path) = self._parse_cp_arg(src)
+        (dst_cid, dst_path) = self._parse_cp_arg(dst)
+        if bool(src_cid) == bool(dst_cid):
+            Msg().err("Error: one of source or destination must be a container")
+            return self.STATUS_ERROR
+
+        if src_cid:
+            container_dir = self.localrepo.cd_container(src_cid)
+            if not container_dir:
+                Msg().err("Error: container not found:", src_cid)
+                return self.STATUS_ERROR
+            source = self._container_realpath(container_dir + "/ROOT",
+                                              src_path, False)
+            if not source or not os.path.lexists(source):
+                Msg().err("Error: source path not found in container:", src_path)
+                return self.STATUS_ERROR
+            dest_is_dir = dst.endswith("/") or os.path.isdir(dst)
+            target = dst
+            if dest_is_dir:
+                target = os.path.join(dst,
+                                      os.path.basename(source.rstrip("/")))
+            if not self._copy_path(source, target):
+                Msg().err("Error: copying from container:", src)
+                return self.STATUS_ERROR
+            return self.STATUS_OK
+
+        container_dir = self.localrepo.cd_container(dst_cid)
+        if not container_dir:
+            Msg().err("Error: container not found:", dst_cid)
+            return self.STATUS_ERROR
+        if not os.path.lexists(src):
+            Msg().err("Error: source path not found:", src)
+            return self.STATUS_ERROR
+        target = self._container_realpath(container_dir + "/ROOT",
+                                          dst_path, True)
+        if not target:
+            Msg().err("Error: destination path escapes container:", dst_path)
+            return self.STATUS_ERROR
+        if dst_path.endswith("/") or os.path.isdir(target):
+            target = os.path.join(target, os.path.basename(src.rstrip("/")))
+        if not self._copy_path(src, target):
+            Msg().err("Error: copying into container:", dst)
+            return self.STATUS_ERROR
         return self.STATUS_OK
 
     def do_protect(self, cmdp):
@@ -1547,13 +1971,18 @@ Commands:
 
   search <repo/expression>      :Search dockerhub for container images
   pull <repo/image:tag>         :Pull container image from dockerhub
+  push <repo/image:tag>         :Upload image to a docker registry
   create <repo/image:tag>       :Create container from a pulled image
   run <container_id|name>       :Execute created container
   run <repo/image:tag>          :Pull, create and execute container
   build -t <repo/image:tag> <path> :Build image from a Dockerfile
+  commit <container> <repo/image:tag> :Create an image from a container
 
   images -l                     :List container images
+  history <repo/image:tag>      :List the layers of an image
   ps -m -s                      :List created containers
+  cp <container>:<path> <host-path> :Copy files from container to host
+  cp <host-path> <container>:<path> :Copy files from host to container
   name <container_id> <name>    :Give name to container
   rmname <name>                 :Delete name from container
   rename <name> <new_name>      :Change container name
@@ -1609,6 +2038,11 @@ Examples:
 
   udocker build -t myrepo/myimage:latest .
   udocker build -f Dockerfile.alt -t myrepo/myimage:latest .
+  udocker commit -m "installed packages" mycontainer myrepo/myimage:latest
+  udocker history myrepo/myimage:latest
+  udocker cp mycontainer:/etc/os-release /tmp/
+  udocker cp /tmp/script.sh mycontainer:/tmp/
+  udocker push myrepo/myimage:latest
 
   udocker run  mycontainer  cat /etc/redhat-release
   udocker run --hostauth --hostenv --bindhome  mycontainer

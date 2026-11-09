@@ -85,7 +85,9 @@ class UMain(object):
             "inspect": self.cli.do_inspect, "login": self.cli.do_login,
             "setup": self.cli.do_setup, "install": self.cli.do_install,
             "tag": self.cli.do_tag, "manifest": self.cli.do_manifest,
-            "build": self.cli.do_build,
+            "build": self.cli.do_build, "commit": self.cli.do_commit,
+            "history": self.cli.do_history, "cp": self.cli.do_cp,
+            "push": self.cli.do_push,
         }
 
         if ((len(self.argv) == 1) or
