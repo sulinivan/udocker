@@ -62,6 +62,8 @@ class ExecutionEngineCommon(object):
     opt["dnssearch"] = []            # DNS search domains
     opt["tty"] = False               # Allocate a pseudo terminal
     opt["interactive"] = False       # Keep stdin attached (non tty stdin)
+    opt["addhost"] = []              # Extra /etc/hosts entries
+    opt["labels"] = []               # Container labels
 
     def __init__(self, localrepo, exec_mode):
         self.localrepo = localrepo            # LocalRepository instance
@@ -244,7 +246,49 @@ class ExecutionEngineCommon(object):
                           % novolume, l=Msg.WAR)
         if not self._setup_resolv_conf():
             return False
+        if not self._setup_hosts():
+            return False
         return self._check_volumes()
+
+    def _setup_hosts(self):
+        """Private /etc/hosts and /etc/hostname for --hostname/--add-host"""
+        hostname = self.opt.get("hostname") or ""
+        addhost = self.opt.get("addhost") or []
+        if not (hostname or addhost):
+            return True
+        if hostname and ("/" in hostname or " " in hostname):
+            Msg().err("Error: invalid hostname:", hostname)
+            return False
+        lines = ["127.0.0.1 localhost",
+                 "::1 localhost ip6-localhost ip6-loopback"]
+        if hostname:
+            lines.append("127.0.1.1 %s" % hostname)
+        for entry in addhost:
+            text = str(entry)
+            if ":" in text:
+                (name, address) = text.split(":", 1)
+            elif "=" in text:
+                (name, address) = text.split("=", 1)
+            else:
+                name = address = ""
+            if not (name and address):
+                Msg().err("Error: --add-host expects host:ip:", text)
+                return False
+            lines.append("%s %s" % (address, name))
+        tmp_file = FileUtil("hosts").mktmp()
+        if not FileUtil(tmp_file).putdata("\n".join(lines) + "\n", "w"):
+            Msg().err("Error: cannot create the container /etc/hosts")
+            return False
+        self.opt["vol"].append(tmp_file + ":/etc/hosts")
+        if hostname:
+            tmp_name = FileUtil("hostname").mktmp()
+            if not FileUtil(tmp_name).putdata(hostname + "\n", "w"):
+                Msg().err("Error: cannot create the container /etc/hostname")
+                return False
+            self.opt["vol"].append(tmp_name + ":/etc/hostname")
+            if not self.opt["env"].getenv("HOSTNAME"):
+                self.opt["env"].append("HOSTNAME=%s" % hostname)
+        return True
 
     def _setup_resolv_conf(self):
         """Provide the container /etc/resolv.conf from --dns / --dns-search

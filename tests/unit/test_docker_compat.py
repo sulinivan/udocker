@@ -198,6 +198,8 @@ class DockerCompatOutputTestCase(TestCase):
             json.dump({"entrypoint": [], "cmd": ["echo", "hi"]}, fp)
         with open(os.path.join(container_dir, "volumes.json"), "w") as fp:
             json.dump(["vol1:/data"], fp)
+        with open(os.path.join(container_dir, "labels.json"), "w") as fp:
+            json.dump({"team": "infra"}, fp)
         self.assertTrue(repo.create_volume("vol1"))
         self.assertTrue(repo.set_container_name(cid, "web"))
         cli = self._cli(repo)
@@ -215,6 +217,7 @@ class DockerCompatOutputTestCase(TestCase):
         self.assertEqual(data[0]["Mounts"][0]["Type"], "volume")
         self.assertEqual(data[0]["Mounts"][0]["Name"], "vol1")
         self.assertEqual(data[0]["HostConfig"]["NetworkMode"], "host")
+        self.assertEqual(data[0]["Config"]["Labels"], {"team": "infra"})
         cmdp = CmdParser()
         cmdp.parse(["udocker", "inspect", "-f", "{{.State.ExitCode}}",
                     "--type=container", cid])
@@ -222,7 +225,19 @@ class DockerCompatOutputTestCase(TestCase):
             self.assertEqual(cli.do_inspect(cmdp), 0)
         self.assertEqual(mock_msg.return_value.out.call_args[0][0], "7")
 
-    def test_06_info_and_version(self):
+    def test_06_paused_ps(self):
+        """Test06 paused containers are listed by default with docker text"""
+        container_dir = self._container_dir(
+            "pau1", {"status": "paused", "pid": os.getpid(),
+                     "timestamp": "2026-11-10T10:00:00Z", "ports": []})
+        localrepo = self._localrepo({"pau1": (container_dir, ["idle"])})
+        out = self._run_ps(localrepo)
+        self.assertIn("pau1", out)
+        self.assertIn("(Paused)", out)
+        out_state = self._run_ps(localrepo, "--format", "{{.State}}")
+        self.assertEqual(out_state.strip(), "paused")
+
+    def test_07_info_and_version(self):
         """Test06 info and version print docker fields and templates"""
         from udocker import __version__
         localrepo = Mock()

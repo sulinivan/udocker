@@ -21,7 +21,8 @@ COMPAT_GROUPS = {
         "logs": ["logs"], "inspect": ["inspect"], "top": ["top"],
         "stats": ["stats"], "port": ["port"], "diff": ["diff"],
         "wait": ["wait"], "commit": ["commit"], "cp": ["cp"],
-        "rename": ["rename"],
+        "rename": ["rename"], "pause": ["pause"],
+        "unpause": ["unpause"],
     },
     "image": {
         "ls": ["images"], "list": ["images"], "pull": ["pull"],
@@ -177,6 +178,7 @@ class UMain(object):
             "system": self.cli.do_system, "image": self.cli.do_image,
             "prune": self.cli.do_prune, "compose": self.cli.do_compose,
             "volume": self.cli.do_volume, "info": self.cli.do_info,
+            "pause": self.cli.do_pause, "unpause": self.cli.do_unpause,
         }
 
         if ((len(self.argv) == 1) or

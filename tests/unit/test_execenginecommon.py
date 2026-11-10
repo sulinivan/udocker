@@ -213,6 +213,36 @@ class ExecutionEngineCommonTestCase(TestCase):
         status = ex_eng._check_volumes()
         self.assertTrue(status)
 
+    @patch('udocker.engine.base.Msg')
+    @patch('udocker.engine.base.FileUtil')
+    def test_28__setup_hosts(self, mock_futil, mock_msg):
+        """Test28 ExecutionEngineCommon()._setup_hosts()."""
+        mock_msg.level = 0
+        ex_eng = ExecutionEngineCommon(self.local, self.xmode)
+        saved = (ex_eng.opt.get("hostname") or "",
+                 list(ex_eng.opt.get("addhost") or []),
+                 list(ex_eng.opt.get("vol") or []),
+                 ex_eng.opt["env"].getenv("HOSTNAME"))
+        try:
+            ex_eng.opt["hostname"] = "myhost"
+            ex_eng.opt["addhost"] = ["db:10.0.0.2"]
+            ex_eng.opt["vol"] = []
+            mock_futil.return_value.mktmp.side_effect = ["/tmp/hosts",
+                                                         "/tmp/hostname"]
+            mock_futil.return_value.putdata.return_value = True
+            self.assertTrue(ex_eng._setup_hosts())
+            self.assertIn("/tmp/hosts:/etc/hosts", ex_eng.opt["vol"])
+            self.assertIn("/tmp/hostname:/etc/hostname", ex_eng.opt["vol"])
+            self.assertEqual(ex_eng.opt["env"].getenv("HOSTNAME"), "myhost")
+        finally:
+            ex_eng.opt["hostname"] = saved[0]
+            ex_eng.opt["addhost"] = saved[1]
+            ex_eng.opt["vol"] = saved[2]
+            if saved[3] is None:
+                ex_eng.opt["env"].unsetenv("HOSTNAME")
+            else:
+                ex_eng.opt["env"].setenv("HOSTNAME", saved[3])
+
     @patch('udocker.engine.base.NixAuthentication.get_home')
     def test_08__get_bindhome(self, mock_gethome):
         """Test08 ExecutionEngineCommon()._get_bindhome()."""

@@ -141,10 +141,7 @@ class RuncEngine(ExecutionEngineCommon):
         json_obj = self._container_specjson
         json_obj["root"]["path"] = os.path.realpath(self.container_root)
         json_obj["root"]["readonly"] = False
-        if '.' in self.opt["hostname"]:
-            json_obj["hostname"] = self.opt["hostname"]
-        else:
-            json_obj["hostname"] = platform.node()
+        json_obj["hostname"] = self.opt["hostname"] or platform.node()
 
         if self.opt["cwd"]:
             json_obj["process"]["cwd"] = self.opt["cwd"]

@@ -146,5 +146,31 @@ class SupervisorTestCase(TestCase):
         self.assertEqual(conf["argv"], ["run", "CID"])
 
 
+    def test_10_pause_resume(self):
+        """Test10 pause/unpause keep the pid and flip the state"""
+        self._state({"status": "running", "pid": os.getpid(), "ports": []})
+        self.assertTrue(supervisor.is_running(self.container_dir))
+        with patch('udocker.supervisor.signal_monitor',
+                   return_value=0) as mock_signal:
+            self.assertTrue(supervisor.pause(self.container_dir))
+        state = supervisor.read_state(self.container_dir)
+        self.assertEqual(state["status"], "paused")
+        self.assertEqual(state["pid"], os.getpid())
+        self.assertTrue(supervisor.is_running(self.container_dir))
+        with patch('udocker.supervisor.signal_monitor',
+                   return_value=0) as mock_signal:
+            self.assertTrue(supervisor.unpause(self.container_dir))
+        self.assertEqual(supervisor.read_state(self.container_dir)["status"],
+                         "running")
+        self.assertEqual(mock_signal.call_args[0][1], "CONT")
+
+    def test_11_reconcile_paused_dead(self):
+        """Test11 a paused container with a dead pid reconciles to exited"""
+        self._state({"status": "paused", "pid": 999999})
+        state = supervisor.reconcile(self.container_dir)
+        self.assertEqual(state["status"], "exited")
+        self.assertEqual(state["exitcode"], 137)
+
+
 if __name__ == '__main__':
     main()

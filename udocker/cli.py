@@ -77,6 +77,18 @@ def _relative_time(timestamp):
     return _human_duration(time.time() - epoch) + " ago"
 
 
+def _container_labels(container_dir):
+    """Labels recorded for a container, empty dict when missing"""
+    if not isinstance(container_dir, (str, bytes)):
+        return {}
+    try:
+        with open(container_dir + "/labels.json", "r") as filep:
+            labels = json.load(filep)
+    except (IOError, OSError, ValueError, TypeError):
+        return {}
+    return labels if isinstance(labels, dict) else {}
+
+
 def _read_state(container_dir):
     """Container state.json as a dict, empty when missing or invalid"""
     if not isinstance(container_dir, (str, bytes)):
@@ -96,12 +108,14 @@ def _docker_status(container_dir, status):
     state = _read_state(container_dir)
     epoch = _parse_timestamp(state.get("timestamp", ""))
     age = _human_duration(time.time() - epoch) if epoch else ""
-    if status == "Running":
+    if status in ("Running", "Paused"):
         if not age:
-            return "Up"
-        if age == "0 seconds":
-            return "Up Less than a second"
-        return "Up " + age
+            status_text = "Up"
+        elif age == "0 seconds":
+            status_text = "Up Less than a second"
+        else:
+            status_text = "Up " + age
+        return status_text + (" (Paused)" if status == "Paused" else "")
     suffix = " " + age + " ago" if age else ""
     if status == "Interrupted":
         return "Exited (137)" + suffix
@@ -214,6 +228,15 @@ def _filter_match(container, filters):
             image = container.get("image") or ""
             if not any(entry in image for entry in values):
                 return False
+        elif key == "label":
+            labels = container.get("labels") or {}
+            for entry in values:
+                (label_key, separator, label_value) = entry.partition("=")
+                if separator:
+                    if labels.get(label_key) != label_value:
+                        return False
+                elif label_key not in labels:
+                    return False
         else:
             return False
     return True
@@ -446,7 +469,8 @@ class UdockerCLI(object):
             "CreatedAt": created_at,
             "ID": container.get("container_id", ""),
             "Image": container.get("image", ""),
-            "Labels": "",
+            "Labels": ",".join("%s=%s" % item for item in
+                               sorted((container.get("labels") or {}).items())),
             "LocalVolumes": "0",
             "Mounts": "",
             "Names": container.get("name", ""),
@@ -469,12 +493,12 @@ class UdockerCLI(object):
         except (IOError, OSError, ValueError, TypeError):
             return "Created"
         status = state.get("status", "")
-        if status == "running":
+        if status in ("running", "paused"):
             try:
                 os.kill(int(state.get("pid", 0)), 0)
             except (OSError, ValueError, TypeError):
                 return "Interrupted"
-            return "Running"
+            return "Running" if status == "running" else "Paused"
         if status == "exited":
             return "Exited (%s)" % state.get("exitcode", "?")
         if status == "interrupted":
@@ -568,6 +592,22 @@ class UdockerCLI(object):
         try:
             with open(container_dir + "/volumes.json", "w") as filep:
                 json.dump(list(volumes), filep)
+        except (IOError, OSError, ValueError, TypeError):
+            pass
+
+    @staticmethod
+    def _save_labels(container_dir, labels):
+        """Remember the container labels for ps/inspect filters"""
+        if not isinstance(container_dir, str):
+            return
+        data = {}
+        for item in labels or []:
+            (key, separator, value) = str(item).partition("=")
+            if key:
+                data[key] = value if separator else ""
+        try:
+            with open(container_dir + "/labels.json", "w") as filep:
+                json.dump(data, filep)
         except (IOError, OSError, ValueError, TypeError):
             pass
 
@@ -1081,6 +1121,7 @@ class UdockerCLI(object):
         """
         imagespec = cmdp.get("P1")
         name = cmdp.get("--name=")
+        labels = cmdp.get("--label=", "CMD_OPT", True)
         force = cmdp.get("--force")
         if cmdp.missing_options():               # syntax error
             return self.STATUS_ERROR
@@ -1090,6 +1131,8 @@ class UdockerCLI(object):
                 return self.STATUS_ERROR
         container_id = self._create(imagespec)
         if container_id:
+            self._save_labels(self.localrepo.cd_container(container_id),
+                              labels)
             if not name:
                 name = self._generated_container_name()
             Msg().out(container_id)
@@ -1206,6 +1249,18 @@ class UdockerCLI(object):
                 "fl": ("--device=",), "act": "E",
                 "p2": "CMD_OPT", "p3": True
             },
+            "hostname": {
+                "fl": ("--hostname=",), "act": 'R',
+                "p2": "CMD_OPT", "p3": False
+            },
+            "addhost": {
+                "fl": ("--add-host=",), "act": 'E',
+                "p2": "CMD_OPT", "p3": True
+            },
+            "labels": {
+                "fl": ("--label=",), "act": 'E',
+                "p2": "CMD_OPT", "p3": True
+            },
             "nobanner": {
                 "fl": ("--nobanner",), "act": 'R',
                 "p2": "CMD_OPT", "p3": False
@@ -1234,7 +1289,8 @@ class UdockerCLI(object):
                     if option_value or last_value is None:
                         exec_engine.opt[option] = option_value
                 elif cmdp_args["act"] == "E":   # action is extend
-                    exec_engine.opt[option].extend(option_value)
+                    exec_engine.opt.setdefault(option, []).extend(
+                        option_value)
                 last_value = option_value
         if exec_engine:
             exec_engine.opt["nobanner"] = not bool(
@@ -1277,6 +1333,9 @@ class UdockerCLI(object):
         --dns=<addr>               :set the container DNS server (repeatable)
         --dns-search=<domain>      :set the container DNS search domain
         --volumes-from=<container> :copy volume bindings of a container
+        --hostname=<name>          :set the container hostname
+        --add-host=<host:ip>       :add a line to the container /etc/hosts
+        --label=<key=value>        :set a container label (repeatable)
 
         Only available in Rn execution modes:
         --device=/dev/xxx          :pass device to container (R1 mode only)
@@ -1361,6 +1420,7 @@ class UdockerCLI(object):
             return self.STATUS_ERROR
         self._save_run_volumes(container_dir, opt.get("vol") or [])
         self._save_run_command(container_dir, opt)
+        self._save_labels(container_dir, opt.get("labels") or [])
         if not self._expand_publish_all(exec_engine, container_id):
             return self.STATUS_ERROR
         portsmap = opt.get("portsmap") or []
@@ -1437,9 +1497,6 @@ class UdockerCLI(object):
                       container_or_image, exec_mode, delete,
                       ports=None, netcoop=False):
         """Start a container in the background under the supervisor"""
-        if delete:
-            Msg().err("Error: --rm cannot be combined with -d")
-            return self.STATUS_ERROR
         if self.localrepo.iswriteable_container(container_id) != 1:
             Msg().err("Error: container is not writable")
             return self.STATUS_ERROR
@@ -1514,6 +1571,10 @@ class UdockerCLI(object):
         if not conf.get("argv"):
             Msg().err("Error: container was not started with -d")
             return self.STATUS_ERROR
+        if supervisor.read_state(container_dir).get("status") == "paused":
+            Msg().err("Error: container is paused;"
+                      " unpause it before restarting:", container_id)
+            return self.STATUS_ERROR
         if supervisor.is_running(container_dir):
             Msg().err("Error: container is already running")
             return self.STATUS_ERROR
@@ -1523,6 +1584,47 @@ class UdockerCLI(object):
                 return self.STATUS_ERROR
         if not supervisor.spawn(container_id, container_dir,
                                 conf["argv"], truncate=False):
+            return self.STATUS_ERROR
+        Msg().out(container_id)
+        return self.STATUS_OK
+
+    def do_pause(self, cmdp):
+        """
+        pause: pause all processes of a running container
+        pause <container-id-or-name>
+        """
+        container_id = self._resolve_container(cmdp.get("P1"))
+        if cmdp.missing_options() or not container_id:
+            return self.STATUS_ERROR
+        container_dir = self.localrepo.cd_container(container_id)
+        state = supervisor.read_state(container_dir)
+        if state.get("status") == "paused":
+            Msg().err("Error: container is already paused:", container_id)
+            return self.STATUS_ERROR
+        if not supervisor.is_running(container_dir):
+            Msg().err("Error: container is not running:", container_id)
+            return self.STATUS_ERROR
+        if not supervisor.pause(container_dir):
+            Msg().err("Error: cannot pause container:", container_id)
+            return self.STATUS_ERROR
+        Msg().out(container_id)
+        return self.STATUS_OK
+
+    def do_unpause(self, cmdp):
+        """
+        unpause: resume a paused container
+        unpause <container-id-or-name>
+        """
+        container_id = self._resolve_container(cmdp.get("P1"))
+        if cmdp.missing_options() or not container_id:
+            return self.STATUS_ERROR
+        container_dir = self.localrepo.cd_container(container_id)
+        state = supervisor.read_state(container_dir)
+        if state.get("status") != "paused":
+            Msg().err("Error: container is not paused:", container_id)
+            return self.STATUS_ERROR
+        if not supervisor.unpause(container_dir):
+            Msg().err("Error: cannot unpause container:", container_id)
             return self.STATUS_ERROR
         Msg().out(container_id)
         return self.STATUS_OK
@@ -1542,6 +1644,10 @@ class UdockerCLI(object):
             Msg().out("Info: container is not running", container_id,
                       l=Msg.INF)
             return self.STATUS_OK
+        if supervisor.read_state(container_dir).get("status") == "paused":
+            Msg().err("Error: container is paused;"
+                      " unpause it before stopping:", container_id)
+            return self.STATUS_ERROR
         if self._stop_container(container_id, timeout) != 0:
             return self.STATUS_ERROR
         Msg().out(container_id)
@@ -1561,6 +1667,10 @@ class UdockerCLI(object):
         conf = supervisor.read_conf(container_dir)
         if not conf.get("argv"):
             Msg().err("Error: container was not started with -d")
+            return self.STATUS_ERROR
+        if supervisor.read_state(container_dir).get("status") == "paused":
+            Msg().err("Error: container is paused;"
+                      " unpause it before restarting:", container_id)
             return self.STATUS_ERROR
         if self._is_runc_mode(container_id):
             (dummy, executable) = self._runc_engine(container_id)
@@ -2044,11 +2154,11 @@ class UdockerCLI(object):
         --no-trunc                 :don't truncate the image id
         --format=json              :print the image list as JSON
         """
+        output_format = cmdp.get("--format=")
         quiet = bool(cmdp.get("-q") or cmdp.get("--quiet"))
         verbose = cmdp.get("-l")
         print_platform = cmdp.get("-p")
         no_trunc = bool(cmdp.get("--no-trunc"))
-        output_format = cmdp.get("--format=")
         dummy = cmdp.get("-a")
         dummy = cmdp.get("--all")
         if cmdp.missing_options():               # syntax error
@@ -2123,15 +2233,15 @@ class UdockerCLI(object):
         -p                         :print platform (udocker)
         --format=json              :print the container list as JSON
         """
+        filters = list(cmdp.get("-f=", "CMD_OPT", True))
+        filters.extend(cmdp.get("--filter=", "CMD_OPT", True))
+        output_format = cmdp.get("--format=")
         show_all = bool(cmdp.get("-a") or cmdp.get("--all"))
         quiet = bool(cmdp.get("-q") or cmdp.get("--quiet"))
         no_trunc = bool(cmdp.get("--no-trunc"))
         print_mode = cmdp.get("-m")
         print_size = cmdp.get("-s")
         print_platform = cmdp.get("-p")
-        filters = list(cmdp.get("-f=", "CMD_OPT", True))
-        filters.extend(cmdp.get("--filter=", "CMD_OPT", True))
-        output_format = cmdp.get("--format=")
         if cmdp.missing_options():               # syntax error
             return self.STATUS_ERROR
 
@@ -2171,6 +2281,7 @@ class UdockerCLI(object):
                             " ago" if created_epoch else ""),
                 "created_epoch": created_epoch,
                 "ports": _docker_ports(_read_state(container_dir).get("ports")),
+                "labels": _container_labels(container_dir),
             })
 
         status_filter = [item.split("=", 1)[1] for item in filters
@@ -2178,7 +2289,7 @@ class UdockerCLI(object):
         selected = []
         for container in containers:
             if (not show_all and not status_filter and
-                    container["status"] != "Running"):
+                    container["status"] not in ("Running", "Paused")):
                 continue
             if filters and not _filter_match(container, filters):
                 continue
@@ -2918,7 +3029,7 @@ class UdockerCLI(object):
         state = _read_state(container_dir)
         status = self._container_status(container_dir)
         timestamps = state.get("timestamp", "") or ""
-        running = status == "Running"
+        running = status in ("Running", "Paused")
         try:
             exit_code = int(state.get("exitcode") or 0)
         except (TypeError, ValueError):
@@ -2957,6 +3068,12 @@ class UdockerCLI(object):
         config.setdefault("Volumes", None)
         config.setdefault("WorkingDir", "")
         config.setdefault("Labels", {})
+        image_labels = config.get("Labels")
+        if not isinstance(image_labels, dict):
+            image_labels = {}
+        merged_labels = dict(image_labels)
+        merged_labels.update(_container_labels(container_dir))
+        config["Labels"] = merged_labels
         port_bindings = {}
         for mapping in state.get("ports") or []:
             parts = str(mapping).split(":")
@@ -3407,6 +3524,8 @@ Docker-style command groups are accepted and translated:
   start <container>             :Start a container created with run -d
   stop <container>              :Stop a running container
   restart <container>           :Stop and start a container
+  pause <container>             :Pause all processes of a container
+  unpause <container>           :Resume a paused container
   kill -s <signal> <container>  :Send a signal to a running container
   exec <container> <command>    :Execute a command in a running container
   logs [-f] <container>         :Show the log of a container

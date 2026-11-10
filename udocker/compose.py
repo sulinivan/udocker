@@ -31,7 +31,8 @@ COMPOSE_FILES = ("compose.yaml", "compose.yml",
 
 SUPPORTED_KEYS = ("image", "build", "container_name", "command",
                   "entrypoint", "environment", "ports", "volumes",
-                  "working_dir", "user", "labels", "depends_on")
+                  "working_dir", "user", "labels", "depends_on",
+                  "hostname", "extra_hosts")
 
 ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}"
                          r"|\$([A-Za-z_][A-Za-z0-9_]*)")
@@ -539,6 +540,25 @@ def volume_name(project, source, volume_defs=None):
     return "%s_%s" % (project, source)
 
 
+def parse_extra_hosts(value):
+    """Normalize extra_hosts to a list of host:ip entries"""
+    result = []
+    if value is None:
+        return result
+    if isinstance(value, dict):
+        return ["%s:%s" % (host, address) for (host, address) in value.items()]
+    if isinstance(value, list):
+        for item in value:
+            text = str(item)
+            if "=" in text:
+                (host, address) = text.split("=", 1)
+                result.append("%s:%s" % (host, address))
+            else:
+                result.append(text)
+        return result
+    return [str(value)]
+
+
 def parse_labels(value):
     """Normalize labels to a list of key=value items"""
     result = []
@@ -619,6 +639,8 @@ def normalize_service(project, service, config, compose_dir,
         "working_dir": str(config.get("working_dir") or ""),
         "user": str(config.get("user") or ""),
         "labels": parse_labels(config.get("labels")),
+        "hostname": str(config.get("hostname") or ""),
+        "extra_hosts": parse_extra_hosts(config.get("extra_hosts")),
         "depends_on": parse_depends_on(config.get("depends_on")),
     }
 
@@ -654,9 +676,12 @@ def run_arguments(plan):
         args.append("--user=" + plan["user"])
     if plan["entrypoint"]:
         args.append("--entrypoint=" + " ".join(plan["entrypoint"]))
-    if plan["labels"]:
-        _warn("labels are not supported by udocker run, ignored: %s"
-              % plan["container_name"])
+    if plan.get("hostname"):
+        args.append("--hostname=" + plan["hostname"])
+    for item in plan.get("extra_hosts") or []:
+        args.append("--add-host=" + item)
+    for item in plan["labels"]:
+        args.append("--label=" + item)
     args.append(plan["container_name"])
     args.extend(plan["command"])
     return args
@@ -1241,7 +1266,8 @@ def do_compose(cli, cmdp):
     sections are built with udocker build; labels are accepted but not
     applied. Named volumes are supported: "name:/path" becomes the udocker
     volume <project>_<name> unless the top-level volumes section sets name:
-    or external: true.
+    or external: true. hostname, extra_hosts and labels are passed to
+    udocker run.
     """
     consume = getattr(cmdp, "consume_all", None)
     if consume is not None:

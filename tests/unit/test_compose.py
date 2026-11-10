@@ -279,6 +279,8 @@ class ComposeProjectTestCase(TestCase):
             "    ports: [\"127.0.0.1:8080:80\", 9000:90/udp, 80]\n"
             "    volumes: [named:/var/lib, ./cache:/cache]\n"
             "    labels: {x: y}\n"
+            "    hostname: apphost\n"
+            "    extra_hosts: [\"db:10.0.0.2\", \"cache=10.0.0.3\"]\n"
             "    command: echo hi\n"
         )
         path = write_compose(self.base, text)
@@ -305,7 +307,10 @@ class ComposeProjectTestCase(TestCase):
         self.assertEqual(args[-3:], ["myproj_app_1", "echo", "hi"])
         self.assertLess(args.index("--env=A=1"), args.index("myproj_app_1"))
         self.assertIn("udp", errors.getvalue())
-        self.assertIn("labels", errors.getvalue())
+        self.assertIn("--label=x=y", args)
+        self.assertIn("--hostname=apphost", args)
+        self.assertIn("--add-host=db:10.0.0.2", args)
+        self.assertIn("--add-host=cache:10.0.0.3", args)
 
     def test_09_named_volumes(self):
         """Test09 named volumes: project prefix, name: and external:"""

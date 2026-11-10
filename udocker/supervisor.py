@@ -68,12 +68,12 @@ def write_conf(container_dir, argv, log, rm=False):
 def is_running(container_dir):
     """Is the container monitor process alive"""
     state = read_state(container_dir)
-    if state.get("status") != "running":
+    if state.get("status") not in ("running", "paused"):
         return False
     return _pid_alive(state.get("pid", 0))
 
 
-def write_state(container_dir, status, exitcode=None, ports=None):
+def write_state(container_dir, status, exitcode=None, ports=None, pid=None):
     """Record the execution state of a container for ps
     Published ports are preserved across updates when not given.
     """
@@ -83,8 +83,8 @@ def write_state(container_dir, status, exitcode=None, ports=None):
     state["status"] = status
     state["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                        time.gmtime())
-    if status == "running":
-        state["pid"] = os.getpid()
+    if status in ("running", "paused"):
+        state["pid"] = pid if pid is not None else os.getpid()
     else:
         state.pop("pid", None)
     if exitcode is not None:
@@ -107,12 +107,38 @@ def reconcile(container_dir):
     from outside; ps and wait must still report them as exited.
     """
     state = read_state(container_dir)
-    if state.get("status") != "running":
+    if state.get("status") not in ("running", "paused"):
         return state
     if _pid_alive(state.get("pid", 0)):
         return state
     write_state(container_dir, "exited", 137)
     return read_state(container_dir)
+
+
+def pause(container_dir):
+    """Freeze the container process group with SIGSTOP (no cgroup needed)"""
+    state = read_state(container_dir)
+    if state.get("status") == "paused":
+        return True
+    if not is_running(container_dir):
+        return False
+    if signal_monitor(container_dir, "STOP") != 0:
+        return False
+    write_state(container_dir, "paused", ports=state.get("ports"),
+                pid=state.get("pid"))
+    return True
+
+
+def unpause(container_dir):
+    """Resume a paused container with SIGCONT"""
+    state = read_state(container_dir)
+    if state.get("status") != "paused":
+        return False
+    if signal_monitor(container_dir, "CONT") != 0:
+        return False
+    write_state(container_dir, "running", ports=state.get("ports"),
+                pid=state.get("pid"))
+    return True
 
 
 def _popen_kwargs():
