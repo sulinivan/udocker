@@ -189,6 +189,13 @@ class DockerOptionsTestCase(TestCase):
         with open(os.path.join(base, "volumes.json")) as filep:
             self.assertEqual(json.load(filep), ["/a:/b"])
 
+    def test_10_consume_all(self):
+        """Test10 consume_all silences the subcommand arguments"""
+        cmdp = CmdParser()
+        cmdp.parse(["udocker", "compose", "up", "-d"])
+        cmdp.consume_all()
+        self.assertEqual(cmdp.missing_options(), [])
+
 
 class SupervisorLifecycleTestCase(TestCase):
     """Process group lifecycle for engines without runc"""

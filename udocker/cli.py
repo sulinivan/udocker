@@ -30,6 +30,7 @@ from udocker.utils.portforward import PortForwarder
 from udocker.utils.containerpath import container_realpath
 from udocker import supervisor
 from udocker import extras
+from udocker import compose
 
 # if Python 3
 if sys.version_info[0] >= 3:
@@ -1539,6 +1540,10 @@ class UdockerCLI(object):
             return self.STATUS_ERROR
         return extras.system_prune(self.localrepo, "all", force)
 
+    def do_compose(self, cmdp):
+        """compose: run a multi-container project (see: udocker compose help)"""
+        return compose.do_compose(self, cmdp)
+
     def do_images(self, cmdp):
         """
         images: list container images
@@ -2479,6 +2484,7 @@ Commands:
   port <container> [port]       :Show published ports of a container
   build -t <repo/image:tag> <path> :Build image from a Dockerfile
   commit <container> <repo/image:tag> :Create an image from a container
+  compose [-f=<file>] up|down|ps|logs|config :Run a compose project
 
   images -l                     :List container images
   history <repo/image:tag>      :List the layers of an image
@@ -2539,6 +2545,7 @@ Examples:
   udocker diff mycontainer
   udocker port mycontainer 80/tcp
   udocker system df
+  udocker compose up -d
   udocker inspect mycontainer
   udocker inspect -p mycontainer
 

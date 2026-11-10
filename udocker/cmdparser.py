@@ -85,6 +85,15 @@ class CmdParser(object):
 
         return None
 
+    def consume_all(self, opt_where="CMD_OPT"):
+        """Mark every argument of a block as consumed.
+
+        Subcommand dispatchers (e.g. compose) parse their own arguments;
+        this keeps missing_options() from reporting them as syntax errors.
+        """
+        self._argv_consumed_options[opt_where] = list(
+            range(len(self._argv_split[opt_where])))
+
     def declare_options(self, opts_string, opt_where="CMD_OPT"):
         """Declare in advance options that are part of the command line
         """

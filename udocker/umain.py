@@ -94,7 +94,7 @@ class UMain(object):
             "top": self.cli.do_top, "stats": self.cli.do_stats,
             "diff": self.cli.do_diff, "port": self.cli.do_port,
             "system": self.cli.do_system, "image": self.cli.do_image,
-            "prune": self.cli.do_prune,
+            "prune": self.cli.do_prune, "compose": self.cli.do_compose,
         }
 
         if ((len(self.argv) == 1) or
