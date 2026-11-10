@@ -4,6 +4,16 @@
 [![SQAaaS badge](https://github.com/EOSC-synergy/SQAaaS/raw/master/badges/badges_150x116/badge_software_gold.png)](https://api.eu.badgr.io/public/assertions/_HIuuD5PRMipzM62mWTk3Q "SQAaaS gold badge achieved")
 
 ---
+
+> **Fork status.** This is `sulinivan/udocker`, a personal fork of
+> [indigo-dc/udocker](https://github.com/indigo-dc/udocker). Development
+> continues on this fork's default branch `master-fork`. `master` mirrors
+> upstream and is not pushed to; `build-and-fixes` is frozen as the head of
+> [PR #461](https://github.com/indigo-dc/udocker/pull/461). On top of that PR
+> this branch adds registry v2 push, `commit`/`cp`/`history`, the
+> detached-container lifecycle, the `extras` commands (`top`, `stats`,
+> `diff`, `port`, `system`, `prune`) and `udocker compose`.
+
 ![logo](docs/logo-small.png)
 
 udocker is a basic user tool to execute simple docker containers in user
