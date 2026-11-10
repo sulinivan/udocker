@@ -348,6 +348,55 @@ class ComposeProjectTestCase(TestCase):
                 ["nolabel:/x"], self.base, "p", {}), ["p_nolabel:/x"])
         self.assertIn("not declared", errors.getvalue())
 
+    def test_09_env_and_ulimits(self):
+        """Test09 .env substitution, env_file merge and ulimits arguments"""
+        text = (
+            "name: envproj\n"
+            "services:\n"
+            "  app:\n"
+            "    image: busybox:${COMPOSE_E2E_TAG}\n"
+            "    env_file: ./app.env\n"
+            "    environment:\n"
+            "      B: from-compose\n"
+            "    ulimits:\n"
+            "      nofile: 128\n"
+            "      nproc:\n"
+            "        soft: 16\n"
+            "        hard: 32\n"
+            "    command: true\n"
+        )
+        with open(os.path.join(self.base, ".env"), "w") as filep:
+            filep.write("COMPOSE_E2E_TAG=latest-from-env\n")
+        with open(os.path.join(self.base, "app.env"), "w") as filep:
+            filep.write("A=file\nB=file-value\n# comment\n")
+        os.environ.pop("COMPOSE_E2E_TAG", None)
+        path = write_compose(self.base, text)
+        project = compose.ComposeProject(path)
+        self.assertNotIn("COMPOSE_E2E_TAG", os.environ)
+        plan = project.plan("app")
+        self.assertEqual(plan["image"], "busybox:latest-from-env")
+        self.assertIn("A=file", plan["environment"])
+        self.assertIn("B=from-compose", plan["environment"])
+        self.assertEqual(plan["ulimits"], ["nofile=128", "nproc=16:32"])
+        args = compose.run_arguments(plan)
+        self.assertIn("--env=A=file", args)
+        self.assertIn("--env=B=from-compose", args)
+        self.assertIn("--ulimit=nofile=128", args)
+        self.assertIn("--ulimit=nproc=16:32", args)
+
+    def test_09_missing_env_file(self):
+        """Test09 a missing env_file is a compose error"""
+        text = (
+            "services:\n"
+            "  app:\n"
+            "    image: busybox:latest\n"
+            "    env_file: ./missing.env\n"
+        )
+        path = write_compose(self.base, text)
+        project = compose.ComposeProject(path)
+        with self.assertRaises(compose.ComposeError):
+            project.plan("app")
+
     def test_10_depends_on_order(self):
         """Test10 depends_on orders the services and catches cycles"""
         services = OrderedDict([

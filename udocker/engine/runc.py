@@ -18,6 +18,7 @@ from udocker.utils.fileutil import FileUtil
 from udocker.utils.uvolume import Uvolume
 from udocker.utils.filebind import FileBind
 from udocker.utils.runcenv import runc_container_id, runtime_env
+from udocker.utils import ulimits as ulimits_util
 
 
 class RuncEngine(ExecutionEngineCommon):
@@ -156,6 +157,11 @@ class RuncEngine(ExecutionEngineCommon):
             json_obj["process"]["env"].append("%s=%s" % (env_key, env_val))
 
         json_obj["process"]["args"] = self.opt["cmd"]
+
+        if self.opt.get("ulimit"):
+            entries = ulimits_util.oci_rlimits(self.opt["ulimit"])
+            if entries:
+                json_obj["process"]["rlimits"] = entries
         return json_obj
 
     def _set_id_mappings(self):

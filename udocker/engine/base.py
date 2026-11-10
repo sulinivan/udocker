@@ -64,6 +64,7 @@ class ExecutionEngineCommon(object):
     opt["interactive"] = False       # Keep stdin attached (non tty stdin)
     opt["addhost"] = []              # Extra /etc/hosts entries
     opt["labels"] = []               # Container labels
+    opt["ulimit"] = []               # Resource limits
 
     def __init__(self, localrepo, exec_mode):
         self.localrepo = localrepo            # LocalRepository instance

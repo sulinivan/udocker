@@ -32,6 +32,7 @@ from udocker.utils.mountpoint import MountPoint
 from udocker.utils.portforward import PortForwarder
 from udocker.utils.containerpath import container_realpath
 from udocker.utils.gotemplate import render as render_template
+from udocker.utils import ulimits as ulimits_util
 from udocker import supervisor
 from udocker import extras
 from udocker import compose
@@ -1261,6 +1262,10 @@ class UdockerCLI(object):
                 "fl": ("--label=",), "act": 'E',
                 "p2": "CMD_OPT", "p3": True
             },
+            "ulimit": {
+                "fl": ("--ulimit=",), "act": 'E',
+                "p2": "CMD_OPT", "p3": True
+            },
             "nobanner": {
                 "fl": ("--nobanner",), "act": 'R',
                 "p2": "CMD_OPT", "p3": False
@@ -1336,6 +1341,7 @@ class UdockerCLI(object):
         --hostname=<name>          :set the container hostname
         --add-host=<host:ip>       :add a line to the container /etc/hosts
         --label=<key=value>        :set a container label (repeatable)
+        --ulimit=<name=soft[:hard]>:set a resource limit (repeatable)
 
         Only available in Rn execution modes:
         --device=/dev/xxx          :pass device to container (R1 mode only)
@@ -1437,6 +1443,15 @@ class UdockerCLI(object):
             Msg().err("Error: cannot publish container ports")
             return self.STATUS_ERROR
         self._write_state(container_dir, "running", ports=portsmap)
+        saved_limits = []
+        if opt.get("ulimit"):
+            try:
+                ulimits_util.parse_all(opt["ulimit"])
+                if not str(exec_mode.get_mode()).startswith("R"):
+                    saved_limits = ulimits_util.apply(opt["ulimit"])
+            except ValueError as error:
+                Msg().err("Error: invalid --ulimit:", str(error))
+                return self.STATUS_ERROR
         try:
             exit_status = exec_engine.run(container_id)
         except BaseException:
@@ -1444,6 +1459,8 @@ class UdockerCLI(object):
                 forwarder.stop()
             self._write_state(container_dir, "interrupted")
             raise
+        finally:
+            ulimits_util.restore(saved_limits)
         if forwarder:
             forwarder.stop()
         self._write_state(container_dir, "exited", exitcode=exit_status)

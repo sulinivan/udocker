@@ -30,9 +30,9 @@ COMPOSE_FILES = ("compose.yaml", "compose.yml",
                  "docker-compose.yml", "docker-compose.yaml")
 
 SUPPORTED_KEYS = ("image", "build", "container_name", "command",
-                  "entrypoint", "environment", "ports", "volumes",
-                  "working_dir", "user", "labels", "depends_on",
-                  "hostname", "extra_hosts")
+                  "entrypoint", "environment", "env_file", "ports",
+                  "volumes", "working_dir", "user", "labels", "depends_on",
+                  "hostname", "extra_hosts", "ulimits")
 
 ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}"
                          r"|\$([A-Za-z_][A-Za-z0-9_]*)")
@@ -436,6 +436,84 @@ def parse_command(value):
         raise ComposeError("cannot parse command %s: %s" % (value, error))
 
 
+def load_dotenv(directory):
+    """Read the compose .env file of a directory, empty when missing"""
+    values = OrderedDict()
+    path = os.path.join(directory, ".env")
+    try:
+        with open(path, "r") as filep:
+            lines = filep.read().splitlines()
+    except (IOError, OSError):
+        return values
+    for line in lines:
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        if text.startswith("export "):
+            text = text[len("export "):]
+        (key, separator, value) = text.partition("=")
+        if not separator:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
+        if key.strip():
+            values[key.strip()] = value
+    return values
+
+
+def parse_env_files(value, compose_dir):
+    """Read compose env_file entries into VAR=VALUE items"""
+    result = []
+    if value is None:
+        return result
+    files = value if isinstance(value, list) else [value]
+    for item in files:
+        path = str(item)
+        if not os.path.isabs(path):
+            path = os.path.normpath(os.path.join(compose_dir, path))
+        try:
+            with open(path, "r") as filep:
+                lines = filep.read().splitlines()
+        except (IOError, OSError) as error:
+            raise ComposeError("cannot read env_file %s: %s" % (path, error))
+        for line in lines:
+            entry = line.strip()
+            if not entry or entry.startswith("#"):
+                continue
+            if entry.startswith("export "):
+                entry = entry[len("export "):]
+            if "=" not in entry:
+                _warn("env_file line without value ignored: %s" % entry)
+                continue
+            (key, dummy, val) = entry.partition("=")
+            val = val.strip()
+            if (len(val) >= 2 and val[0] == val[-1] and
+                    val[0] in ('"', "'")):
+                val = val[1:-1]
+            result.append("%s=%s" % (key.strip(), val))
+    return result
+
+
+def parse_ulimits(value):
+    """Normalize compose ulimits to docker --ulimit statements"""
+    result = []
+    if value is None:
+        return result
+    if not isinstance(value, dict):
+        raise ComposeError("ulimits must be a mapping")
+    for (name, spec) in value.items():
+        if isinstance(spec, dict):
+            soft = spec.get("soft")
+            hard = spec.get("hard", soft)
+            if soft is None:
+                raise ComposeError("ulimits %s: soft required" % name)
+            result.append("%s=%s:%s" % (name, soft, hard))
+        else:
+            result.append("%s=%s" % (name, spec))
+    return result
+
+
 def parse_environment(value):
     """Normalize environment to a list of VAR=VALUE items"""
     result = []
@@ -626,13 +704,21 @@ def normalize_service(project, service, config, compose_dir,
     name = config.get("container_name")
     if not name:
         name = container_name(project, service)
+    environment = parse_environment(config.get("environment"))
+    env_file_values = parse_env_files(config.get("env_file"), compose_dir)
+    merged = OrderedDict()
+    for item in env_file_values + environment:
+        (key, separator, value) = item.partition("=")
+        if separator:
+            merged[key] = value
+    environment = ["%s=%s" % (key, value) for (key, value) in merged.items()]
     return {
         "image": image,
         "container_name": str(name),
         "build": context,
         "command": parse_command(config.get("command")),
         "entrypoint": parse_command(config.get("entrypoint")),
-        "environment": parse_environment(config.get("environment")),
+        "environment": environment,
         "ports": parse_ports(config.get("ports")),
         "volumes": parse_volumes(config.get("volumes"), compose_dir,
                                  project, volume_defs),
@@ -641,6 +727,7 @@ def normalize_service(project, service, config, compose_dir,
         "labels": parse_labels(config.get("labels")),
         "hostname": str(config.get("hostname") or ""),
         "extra_hosts": parse_extra_hosts(config.get("extra_hosts")),
+        "ulimits": parse_ulimits(config.get("ulimits")),
         "depends_on": parse_depends_on(config.get("depends_on")),
     }
 
@@ -682,6 +769,8 @@ def run_arguments(plan):
         args.append("--add-host=" + item)
     for item in plan["labels"]:
         args.append("--label=" + item)
+    for item in plan.get("ulimits") or []:
+        args.append("--ulimit=" + item)
     args.append(plan["container_name"])
     args.extend(plan["command"])
     return args
@@ -721,10 +810,20 @@ class ComposeProject(object):
     """A compose file, its project name and the service plans"""
 
     def __init__(self, path, name=None):
-        self.file = ComposeFile()
-        self.file.load(path)
         self.path = path
         self.dir = os.path.dirname(os.path.abspath(path))
+        self.file = ComposeFile()
+        dotenv = load_dotenv(self.dir)
+        restore = []
+        for (key, value) in dotenv.items():
+            if key not in os.environ:
+                restore.append(key)
+                os.environ[key] = value
+        try:
+            self.file.load(path)
+        finally:
+            for key in restore:
+                os.environ.pop(key, None)
         self.services = self.file.services()
         source = name or self.file.raw.get("name") or \
             os.path.basename(self.dir)
@@ -1262,12 +1361,11 @@ def do_compose(cli, cmdp):
 
     Differences from docker compose: no container networks beyond the host
     network stack, no health checks, restart policies or scaling; only tcp
-    ports with a host port are published; images are not pulled; build
-    sections are built with udocker build; labels are accepted but not
-    applied. Named volumes are supported: "name:/path" becomes the udocker
-    volume <project>_<name> unless the top-level volumes section sets name:
-    or external: true. hostname, extra_hosts and labels are passed to
-    udocker run.
+    ports with a host port are published; images are not pulled. Supported:
+    build sections via udocker build, named volumes ("name:/path" becomes
+    <project>_<name> unless the top-level volumes section sets name: or
+    external: true), hostname/extra_hosts/labels, env_file, .env
+    substitution, ulimits and extra_hosts, all passed to udocker run.
     """
     consume = getattr(cmdp, "consume_all", None)
     if consume is not None:
