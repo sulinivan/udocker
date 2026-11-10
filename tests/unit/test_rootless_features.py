@@ -233,12 +233,11 @@ class RootlessFeaturesTestCase(TestCase):
             self.assertEqual(cli.do_ps(cmdp), 0)
         output = mock_msg.return_value.out.call_args[0][0]
         data = json.loads(output)
-        self.assertEqual(len(data), 1)
-        self.assertEqual(data[0]["container_id"], "CID")
-        self.assertEqual(data[0]["status"], "Exited (0)")
-        self.assertEqual(data[0]["mode"], "P1")
-        self.assertEqual(data[0]["image"], "myimage:latest")
-        self.assertEqual(data[0]["name"], "mycontainer")
+        self.assertEqual(data["ID"], "CID")
+        self.assertEqual(data["State"], "exited")
+        self.assertTrue(data["Status"].startswith("Exited (0)"))
+        self.assertEqual(data["Image"], "myimage:latest")
+        self.assertEqual(data["Names"], "mycontainer")
 
     def test_10_images_json(self):
         """Test10 images --format=json emits the image list as JSON"""
@@ -254,9 +253,10 @@ class RootlessFeaturesTestCase(TestCase):
         with patch('udocker.cli.Msg') as mock_msg:
             self.assertEqual(cli.do_images(cmdp), 0)
         data = json.loads(mock_msg.return_value.out.call_args[0][0])
-        self.assertEqual(data[0]["repository"], "img1")
-        self.assertEqual(data[0]["size"], 1048576)
-        self.assertTrue(data[0]["protected"])
+        self.assertEqual(data["Repository"], "img1")
+        self.assertEqual(data["Tag"], "tag1")
+        self.assertEqual(data["ID"], "l1")
+        self.assertEqual(data["Size"], "1.00MB")
 
     def test_11_history(self):
         """Test11 history prints layers newest first with the top comment"""

@@ -34,6 +34,7 @@ COMPAT_GROUPS = {
     },
     "system": {
         "df": ["system", "df"], "prune": ["system", "prune"],
+        "info": ["info"],
     },
 }
 
@@ -175,7 +176,7 @@ class UMain(object):
             "diff": self.cli.do_diff, "port": self.cli.do_port,
             "system": self.cli.do_system, "image": self.cli.do_image,
             "prune": self.cli.do_prune, "compose": self.cli.do_compose,
-            "volume": self.cli.do_volume,
+            "volume": self.cli.do_volume, "info": self.cli.do_info,
         }
 
         if ((len(self.argv) == 1) or

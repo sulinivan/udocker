@@ -845,25 +845,58 @@ def _udocker(args, stream=False):
             _terminate(proc)
 
 
+def _parse_json_records(text):
+    """Parse a JSON array or docker-style newline delimited JSON records"""
+    text = text.strip()
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return [data]
+    records = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            raise ComposeError("cannot parse the container list")
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
 def list_containers():
     """Return the containers of the repository as parsed JSON records"""
     (status, output) = _udocker(["ps", "-a", "--format=json"])
     if status != 0:
         raise ComposeError("cannot list containers: %s" % output.strip())
-    try:
-        containers = json.loads(output.strip() or "[]")
-    except ValueError:
-        raise ComposeError("cannot parse the container list")
-    if not isinstance(containers, list):
-        raise ComposeError("cannot parse the container list")
-    return containers
+    return _parse_json_records(output)
+
+
+def record_field(record, name, default=""):
+    """Read a field from an udocker or a docker ps record"""
+    if name in record:
+        return record[name]
+    aliases = {"name": "Names", "status": "State", "container_id": "ID",
+               "image": "Image"}
+    alias = aliases.get(name)
+    if alias and alias in record:
+        return record[alias]
+    return default
 
 
 def container_index(containers):
     """Map every container name to its ps record"""
     index = {}
     for container in containers:
-        for name in str(container.get("name") or "").split(","):
+        for name in str(record_field(container, "name")).split(","):
             if name:
                 index[name] = container
     return index
@@ -1027,7 +1060,7 @@ def _cmd_up(cli, args):
             if status != 0:
                 Msg().err("Error: cannot create container:", name)
                 return cli.STATUS_ERROR
-        elif str(record.get("status") or "").lower() == "running":
+        elif str(record_field(record, "status")).lower() == "running":
             Msg().out("Info: container is already running: %s" % name,
                       l=Msg.INF)
             started.append(name)
@@ -1112,8 +1145,8 @@ def _cmd_ps(cli, args):
         else:
             continue
         record = index[name]
-        rows.append((name, service, str(record.get("status") or ""),
-                     str(record.get("image") or "")))
+        rows.append((name, service, str(record_field(record, "status")),
+                     str(record_field(record, "image"))))
     if not rows:
         Msg().out("Info: no containers for project %s" % project.name,
                   l=Msg.INF)

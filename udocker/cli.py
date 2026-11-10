@@ -31,6 +31,7 @@ from udocker.utils.filebind import FileBind
 from udocker.utils.mountpoint import MountPoint
 from udocker.utils.portforward import PortForwarder
 from udocker.utils.containerpath import container_realpath
+from udocker.utils.gotemplate import render as render_template
 from udocker import supervisor
 from udocker import extras
 from udocker import compose
@@ -422,6 +423,40 @@ class UdockerCLI(object):
     def _write_state(container_dir, status, exitcode=None, ports=None):
         """Record the execution state of a container for ps"""
         supervisor.write_state(container_dir, status, exitcode, ports=ports)
+
+    @staticmethod
+    def _ps_record(container):
+        """Docker ps --format json record of one container"""
+        status = container.get("status", "")
+        if status == "Running":
+            state = "running"
+        elif status.startswith("Exited") or status == "Interrupted":
+            state = "exited"
+        elif status == "Paused":
+            state = "paused"
+        else:
+            state = "created"
+        created_epoch = container.get("created_epoch") or 0
+        created_at = ""
+        if created_epoch:
+            created_at = time.strftime(
+                "%Y-%m-%d %H:%M:%S %z", time.localtime(created_epoch))
+        return {
+            "Command": container.get("command", ""),
+            "CreatedAt": created_at,
+            "ID": container.get("container_id", ""),
+            "Image": container.get("image", ""),
+            "Labels": "",
+            "LocalVolumes": "0",
+            "Mounts": "",
+            "Names": container.get("name", ""),
+            "Networks": "host",
+            "Ports": container.get("ports", ""),
+            "RunningFor": container.get("created", ""),
+            "Size": "0B",
+            "State": state,
+            "Status": container.get("docker_status", ""),
+        }
 
     @staticmethod
     def _container_status(container_dir):
@@ -1966,13 +2001,36 @@ class UdockerCLI(object):
                     break
         if short_id.startswith("sha256:"):
             short_id = short_id[len("sha256:"):]
+        created_at = ""
+        created_epoch = _parse_timestamp(created)
+        if created_epoch is not None:
+            created_at = time.strftime(
+                "%Y-%m-%d %H:%M:%S +0000 UTC", time.gmtime(created_epoch))
         return {
             "repository": imagerepo,
             "tag": tag,
             "image_id": short_id if no_trunc else short_id[:12],
             "full_id": short_id,
             "created": _relative_time(created) if created else "N/A",
+            "created_at": created_at,
             "size": size,
+        }
+
+    @staticmethod
+    def _image_record(row):
+        """Docker images --format json record of one image"""
+        return {
+            "Containers": "N/A",
+            "CreatedAt": row.get("created_at", ""),
+            "CreatedSince": row.get("created", ""),
+            "Digest": "<none>",
+            "ID": row.get("full_id", ""),
+            "Repository": row.get("repository", ""),
+            "SharedSize": "N/A",
+            "Size": extras.format_size(row.get("size", 0)),
+            "Tag": row.get("tag", ""),
+            "UniqueSize": "N/A",
+            "VirtualSize": extras.format_size(row.get("size", 0)),
         }
 
     def do_images(self, cmdp):
@@ -1998,22 +2056,17 @@ class UdockerCLI(object):
         images_list = self.localrepo.get_imagerepos()
 
         if output_format == "json":
-            images_json = []
             for (imagerepo, tag) in images_list:
-                self.localrepo.cd_imagerepo(imagerepo, tag)
-                size = 0
-                for (dummy, layer_size) in self.localrepo.get_layers(
-                        imagerepo, tag):
-                    size += layer_size
-                images_json.append({
-                    "repository": imagerepo,
-                    "tag": tag,
-                    "protected": bool(self.localrepo.isprotected_imagerepo(
-                        imagerepo, tag)),
-                    "platform": self.localrepo.get_image_platform_fmt(),
-                    "size": size,
-                })
-            Msg().out(json.dumps(images_json, sort_keys=True, indent=4))
+                row = self._image_row(imagerepo, tag, no_trunc)
+                Msg().out(json.dumps(self._image_record(row),
+                                     sort_keys=True))
+            return self.STATUS_OK
+
+        if output_format and output_format != "table":
+            for (imagerepo, tag) in images_list:
+                row = self._image_row(imagerepo, tag, no_trunc)
+                Msg().out(render_template(output_format,
+                                          self._image_record(row)))
             return self.STATUS_OK
 
         if verbose or print_platform:
@@ -2134,7 +2187,15 @@ class UdockerCLI(object):
                       reverse=True)
 
         if output_format == "json":
-            Msg().out(json.dumps(selected, sort_keys=True, indent=4))
+            for container in selected:
+                Msg().out(json.dumps(self._ps_record(container),
+                                     sort_keys=True))
+            return self.STATUS_OK
+
+        if output_format and output_format != "table":
+            for container in selected:
+                Msg().out(render_template(output_format,
+                                          self._ps_record(container)))
             return self.STATUS_OK
 
         if quiet:
@@ -2774,43 +2835,289 @@ class UdockerCLI(object):
 
         return self.STATUS_OK
 
+    @staticmethod
+    def _recorded_command(container_dir):
+        """The command recorded by the last run, empty dict when missing"""
+        if not isinstance(container_dir, (str, bytes)):
+            return {}
+        try:
+            with open(container_dir + "/cmd.json", "r") as filep:
+                recorded = json.load(filep)
+        except (IOError, OSError, ValueError, TypeError):
+            return {}
+        return recorded if isinstance(recorded, dict) else {}
+
+    @classmethod
+    def _container_argv(cls, container_dir, config):
+        """Command tokens of the container: last run first, image next"""
+        recorded = cls._recorded_command(container_dir)
+        if recorded:
+            parts = _as_command_list(recorded.get("entrypoint"))
+            parts.extend(_as_command_list(recorded.get("cmd")))
+            if parts:
+                return parts
+        if isinstance(config, dict):
+            parts = _as_command_list(config.get("Entrypoint"))
+            parts.extend(_as_command_list(config.get("Cmd")))
+            return parts
+        return []
+
+    @staticmethod
+    def _container_mounts(localrepo, container_dir):
+        """Docker Mounts entries from the recorded volume bindings"""
+        mounts = []
+        if not isinstance(container_dir, (str, bytes)):
+            return mounts
+        try:
+            with open(container_dir + "/volumes.json", "r") as filep:
+                specs = json.load(filep)
+        except (IOError, OSError, ValueError, TypeError):
+            return mounts
+        if not isinstance(specs, list):
+            return mounts
+        for spec in specs:
+            (source, destination) = str(spec).split(":", 1)
+            if source.startswith("/"):
+                mounts.append({
+                    "Type": "bind", "Name": "", "Source": source,
+                    "Destination": destination, "Driver": "",
+                    "Mode": "", "RW": True, "Propagation": "",
+                })
+            else:
+                mounts.append({
+                    "Type": "volume", "Name": source,
+                    "Source": localrepo.get_volume_path(source),
+                    "Destination": destination, "Driver": "local",
+                    "Mode": "", "RW": True, "Propagation": "",
+                })
+        return mounts
+
+    @staticmethod
+    def _docker_state_name(status):
+        """Docker State.Status value from the udocker status text"""
+        if status == "Running":
+            return "running"
+        if status.startswith("Exited") or status == "Interrupted":
+            return "exited"
+        if status == "Paused":
+            return "paused"
+        return "created"
+
+    def _inspect_container(self, container_id):
+        """Docker shaped metadata of a container"""
+        container_dir = self.localrepo.cd_container(container_id) or ""
+        try:
+            (dummy, container_json) = ContainerStructure(
+                self.localrepo, container_id).get_container_attr()
+        except (AttributeError, KeyError, ValueError, TypeError):
+            container_json = {}
+        if not isinstance(container_json, dict):
+            container_json = {}
+        config = container_json.get("config")
+        config = dict(config) if isinstance(config, dict) else {}
+        state = _read_state(container_dir)
+        status = self._container_status(container_dir)
+        timestamps = state.get("timestamp", "") or ""
+        running = status == "Running"
+        try:
+            exit_code = int(state.get("exitcode") or 0)
+        except (TypeError, ValueError):
+            exit_code = 0
+        try:
+            pid = int(state.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        recorded = self._recorded_command(container_dir)
+        if recorded:
+            entrypoint = _as_command_list(recorded.get("entrypoint"))
+            if entrypoint:
+                config["Entrypoint"] = entrypoint
+            config["Cmd"] = _as_command_list(recorded.get("cmd"))
+        argv = self._container_argv(container_dir, config)
+        image = ""
+        if isinstance(container_dir, (str, bytes)):
+            try:
+                with open(container_dir + "/imagerepo.name", "r") as filep:
+                    image = filep.read().strip()
+            except (IOError, OSError):
+                image = ""
+        names = self.localrepo.get_container_name(container_id) or []
+        name = "/" + str(names[0]) if names else "/" + container_id
+        config.setdefault("Hostname", "")
+        config.setdefault("Domainname", "")
+        config.setdefault("User", "")
+        config.setdefault("AttachStdin", False)
+        config.setdefault("AttachStdout", False)
+        config.setdefault("AttachStderr", False)
+        config.setdefault("Tty", False)
+        config.setdefault("Env", [])
+        config.setdefault("Cmd", argv[1:] if argv else [])
+        config.setdefault("Entrypoint", None)
+        config.setdefault("Image", image)
+        config.setdefault("Volumes", None)
+        config.setdefault("WorkingDir", "")
+        config.setdefault("Labels", {})
+        port_bindings = {}
+        for mapping in state.get("ports") or []:
+            parts = str(mapping).split(":")
+            if len(parts) == 2:
+                port_bindings["%s/tcp" % parts[1]] = [
+                    {"HostIp": "0.0.0.0", "HostPort": parts[0]}]
+        mounts = self._container_mounts(self.localrepo, container_dir)
+        binds = []
+        if isinstance(container_dir, (str, bytes)):
+            try:
+                with open(container_dir + "/volumes.json", "r") as filep:
+                    binds = [str(item) for item in json.load(filep)]
+            except (IOError, OSError, ValueError, TypeError):
+                binds = []
+        created = ""
+        if isinstance(container_dir, (str, bytes)):
+            try:
+                created = time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ",
+                    time.gmtime(os.path.getmtime(
+                        container_dir + "/container.json")))
+            except (IOError, OSError, TypeError):
+                created = ""
+        return {
+            "Id": container_id,
+            "Created": created,
+            "Path": argv[0] if argv else "",
+            "Args": argv[1:] if argv else [],
+            "State": {
+                "Status": self._docker_state_name(status),
+                "Running": running,
+                "Paused": status == "Paused",
+                "Restarting": False,
+                "OOMKilled": False,
+                "Dead": False,
+                "Pid": pid,
+                "ExitCode": exit_code,
+                "Error": "",
+                "StartedAt": timestamps if running else "",
+                "FinishedAt": "" if running else timestamps,
+            },
+            "Image": image,
+            "Name": name,
+            "RestartCount": 0,
+            "Driver": "udocker",
+            "Platform": "linux",
+            "Mounts": mounts,
+            "Config": config,
+            "HostConfig": {
+                "Binds": binds,
+                "NetworkMode": "host",
+                "PortBindings": port_bindings,
+                "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
+                "AutoRemove": False,
+                "Privileged": False,
+            },
+            "NetworkSettings": {
+                "Ports": port_bindings,
+                "Networks": {"host": {
+                    "NetworkID": "", "Driver": "host", "Gateway": "",
+                    "IPAddress": "", "IPPrefixLen": 0,
+                }},
+            },
+        }
+
+    def _inspect_image(self, imagerepo, tag):
+        """Docker shaped metadata of an image tag"""
+        (container_json, dummy) = self.localrepo.get_image_attributes()
+        if not isinstance(container_json, dict):
+            container_json = {}
+        config = container_json.get("config")
+        config = dict(config) if isinstance(config, dict) else {}
+        layers = self.localrepo.get_layers(imagerepo, tag) or []
+        layer_ids = []
+        size = 0
+        for (layer_path, layer_size) in layers:
+            size += layer_size
+            layer_name = os.path.basename(str(layer_path))
+            if layer_name.endswith(".layer"):
+                layer_name = layer_name[:-len(".layer")]
+            layer_ids.append(layer_name)
+        created = container_json.get("created") or ""
+        return {
+            "Id": self._image_id(),
+            "RepoTags": ["%s:%s" % (imagerepo, tag)],
+            "RepoDigests": [],
+            "Parent": "",
+            "Comment": container_json.get("comment") or "",
+            "Created": created,
+            "DockerVersion": container_json.get("docker_version") or "",
+            "Author": container_json.get("author") or "",
+            "Config": config,
+            "Architecture": container_json.get("architecture") or "unknown",
+            "Os": container_json.get("os") or "linux",
+            "Size": size,
+            "VirtualSize": size,
+            "GraphDriver": {"Name": "udocker", "Data": {}},
+            "RootFS": {"Type": "layers", "Layers": layer_ids},
+            "Metadata": {"LastTagTime": created},
+        }
+
+    def _inspect_one(self, name, obj_type=""):
+        """Docker shaped object for one name, None when not found"""
+        if not name:
+            return None
+        container_id = ""
+        if obj_type != "image":
+            container_id = self.localrepo.get_container_id(name)
+        if container_id:
+            return self._inspect_container(container_id)
+        if obj_type == "container":
+            return None
+        (imagerepo, tag) = self._check_imagespec(name)
+        if imagerepo and self.localrepo.cd_imagerepo(imagerepo, tag):
+            return self._inspect_image(imagerepo, tag)
+        return None
+
     def do_inspect(self, cmdp):
         """
-        inspect: print container metadata JSON from an imagerepo or container
-        inspect <container-id or repo/image:tag>
-        -p                         :print container directory path on host
+        inspect: print docker-like metadata JSON of containers or images
+        inspect [options] <name|id> [<name|id> ...]
+        -f, --format=<template>   :render each object with a Go-template
+        --type=<container|image>  :restrict the object type
+        -s, --size                :accepted, size is always included
+        -p                        :print container ROOT paths (udocker)
         """
-        container_or_image = cmdp.get("P1")
-        container_id = self.localrepo.get_container_id(container_or_image)
+        template = cmdp.get("--format=") or cmdp.get("-f=")
+        obj_type = cmdp.get("--type=")
         print_dir = cmdp.get("-p")
+        dummy = cmdp.get("-s")
+        objects = cmdp.get("P*") or []
         if cmdp.missing_options():               # syntax error
             return self.STATUS_ERROR
-
-        if container_id:
-            (container_dir, container_json) = ContainerStructure(
-                self.localrepo, container_id).get_container_attr()
-        else:
-            (imagerepo, tag) = self._check_imagespec(container_or_image)
-            if self.localrepo.cd_imagerepo(imagerepo, tag):
-                (container_json, dummy) = self.localrepo.get_image_attributes()
-            else:
-                Msg().err("Error: image not found", imagerepo)
+        if not objects:
+            Msg().err("Error: inspect requires at least one name or id")
+            return self.STATUS_ERROR
+        data = []
+        for name in objects:
+            item = self._inspect_one(name, obj_type or "")
+            if item is None:
+                Msg().err("Error: no such object:", name)
                 return self.STATUS_ERROR
-
+            data.append(item)
         if print_dir:
-            if container_id and container_dir:
+            for name in objects:
+                container_id = self.localrepo.get_container_id(name)
+                container_dir = ""
+                if container_id:
+                    container_dir = self.localrepo.cd_container(container_id)
+                if not container_dir:
+                    Msg().err("Error: -p requires a container:", name)
+                    return self.STATUS_ERROR
                 Msg().out(str(container_dir) + "/ROOT")
-                return self.STATUS_OK
-        elif container_json:
-            try:
-                Msg().out(json.dumps(container_json, sort_keys=True,
-                                     indent=4, separators=(',', ': ')))
-            except (IOError, OSError, AttributeError, ValueError, TypeError):
-                Msg().out(container_json)
             return self.STATUS_OK
-
-        Msg().err("Error: image or container not found", container_or_image)
-        return self.STATUS_ERROR
+        if template:
+            for item in data:
+                Msg().out(render_template(template, item))
+            return self.STATUS_OK
+        Msg().out(json.dumps(data, sort_keys=True, indent=4,
+                             separators=(',', ': ')))
+        return self.STATUS_OK
 
     def do_verify(self, cmdp):
         """
@@ -2946,18 +3253,116 @@ class UdockerCLI(object):
 
     def do_version(self, cmdp):
         """
-        version: Print version information
+        version: print docker-like client and engine versions
+        -f, --format=<template>   :render the information with a Go-template
         """
-        if cmdp.missing_options():  # syntax error
+        template = cmdp.get("--format=") or cmdp.get("-f=")
+        if cmdp.missing_options():               # syntax error
             return self.STATUS_ERROR
+        arch = HostInfo().arch() or "unknown"
+        client = {
+            "Version": __version__,
+            "ApiVersion": "1.44",
+            "GoVersion": "python %s" % sys.version.split()[0],
+            "Os": "linux",
+            "Arch": arch,
+            "Context": "default",
+            "Experimental": False,
+        }
+        server = {
+            "Version": __version__,
+            "ApiVersion": "1.44",
+            "MinAPIVersion": "1.24",
+            "Os": "linux",
+            "Arch": arch,
+            "Engine": {"Name": "udocker"},
+        }
+        data = {"Client": client, "Server": server}
+        if template:
+            Msg().out(render_template(template, data))
+            return self.STATUS_OK
+        Msg().out("Client:")
+        Msg().out(" Version:           %s" % client["Version"])
+        Msg().out(" API version:       %s" % client["ApiVersion"])
+        Msg().out(" Go version:        %s" % client["GoVersion"])
+        Msg().out(" OS/Arch:           %s/%s" % (client["Os"], arch))
+        Msg().out(" Context:           default")
+        Msg().out("")
+        Msg().out("Server: udocker")
+        Msg().out(" Engine:")
+        Msg().out("  Version:          %s" % server["Version"])
+        Msg().out("  API version:      %s (minimum version %s)"
+                  % (server["ApiVersion"], server["MinAPIVersion"]))
+        Msg().out("  OS/Arch:          linux/%s" % arch)
+        return self.STATUS_OK
 
-        try:
-            Msg().out("%s %s" % ("version:", __version__))
-            Msg().out("%s %s" % ("tarball:", Config.conf['tarball']))
-            Msg().out("%s %s" % ("tarball_release:", Config.conf['tarball_release']))
-        except NameError:
+    def do_info(self, cmdp):
+        """
+        info: print docker-like engine and host information
+        -f, --format=<template>   :render the information with a Go-template
+        """
+        template = cmdp.get("--format=") or cmdp.get("-f=")
+        if cmdp.missing_options():               # syntax error
             return self.STATUS_ERROR
-
+        hostinfo = HostInfo()
+        containers = self.localrepo.get_containers_list(False)
+        running = 0
+        for item in containers:
+            container_dir = self.localrepo.cd_container(item[0]) or ""
+            if self._container_status(container_dir) == "Running":
+                running += 1
+        data = {
+            "ID": "",
+            "Name": "udocker",
+            "ServerVersion": __version__,
+            "StorageDriver": "udocker",
+            "LoggingDriver": "udocker",
+            "CgroupDriver": "none",
+            "DockerRootDir": str(Config.conf['topdir']),
+            "OperatingSystem": hostinfo.osversion() or "Linux",
+            "OSType": "linux",
+            "Architecture": hostinfo.arch() or "unknown",
+            "KernelVersion": hostinfo.oskernel() or "",
+            "NCPU": os.cpu_count() or 0,
+            "MemTotal": extras.mem_total_bytes(),
+            "Containers": len(containers),
+            "ContainersRunning": running,
+            "ContainersPaused": 0,
+            "ContainersStopped": len(containers) - running,
+            "Images": len(self.localrepo.get_imagerepos()),
+            "Volumes": len(self.localrepo.get_volumes_list()),
+            "Registry": str(Config.conf['dockerio_registry_url']),
+            "UdockerTarball": str(Config.conf['tarball_release']),
+        }
+        if template:
+            Msg().out(render_template(template, data))
+            return self.STATUS_OK
+        Msg().out("Client:")
+        Msg().out(" Version:           %s" % __version__)
+        Msg().out(" Context:           default")
+        Msg().out("")
+        Msg().out("Server: udocker")
+        Msg().out(" Engine:")
+        Msg().out("  Version:          %s" % data["ServerVersion"])
+        Msg().out("  Storage Driver:   %s" % data["StorageDriver"])
+        Msg().out("  Logging Driver:   %s" % data["LoggingDriver"])
+        Msg().out("  Cgroup Driver:    %s" % data["CgroupDriver"])
+        Msg().out("  Operating System: %s" % data["OperatingSystem"])
+        Msg().out("  OSType:           %s" % data["OSType"])
+        Msg().out("  Architecture:     %s" % data["Architecture"])
+        Msg().out("  Kernel Version:   %s" % data["KernelVersion"])
+        Msg().out("  CPUs:             %s" % data["NCPU"])
+        Msg().out("  Total Memory:     %s"
+                  % extras.format_size(data["MemTotal"]))
+        Msg().out("  Docker Root Dir:  %s" % data["DockerRootDir"])
+        Msg().out("  Udocker tarball:  %s" % data["UdockerTarball"])
+        Msg().out(" Containers:       %s" % data["Containers"])
+        Msg().out("  Running:          %s" % data["ContainersRunning"])
+        Msg().out("  Paused:           0")
+        Msg().out("  Stopped:          %s" % data["ContainersStopped"])
+        Msg().out(" Images:           %s" % data["Images"])
+        Msg().out(" Volumes:          %s" % data["Volumes"])
+        Msg().out(" Registry:         %s" % data["Registry"])
         return self.STATUS_OK
 
     def do_help(self, cmdp):
@@ -2984,6 +3389,8 @@ General options common to all commands must appear before the command:
 Commands:
   --help [command]              :Command specific help
   showconf                      :Print all configuration options
+  version                       :Print docker-like client and engine versions
+  info                          :Print docker-like engine and host information
 
 Docker-style command groups are accepted and translated:
   container ls|run|rm|...       :same as ps, run, rm, ...

@@ -1352,7 +1352,7 @@ class UdockerCLITestCase(TestCase):
         status = udoc.do_inspect(cmdp)
         self.assertEqual(status, 1)
 
-        argv = ["udocker", "inspect"]
+        argv = ["udocker", "inspect", "ipyrad:latest"]
         cmdp = CmdParser()
         cmdp.parse(argv)
         self.local.get_container_id.return_value = ""

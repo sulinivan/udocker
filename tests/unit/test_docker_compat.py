@@ -135,6 +135,14 @@ class DockerCompatOutputTestCase(TestCase):
         out_filter = self._run_ps(localrepo, "-f", "status=exited")
         self.assertIn("ex1", out_filter)
         self.assertNotIn("run1", out_filter)
+        out_tmpl = self._run_ps(localrepo, "--format",
+                                "{{.ID}} {{.Names}} {{.State}}")
+        self.assertIn("run1 web running", out_tmpl)
+        out_json = self._run_ps(localrepo, "--format", "json")
+        record = json.loads(out_json)
+        self.assertEqual(record["ID"], "run1")
+        self.assertEqual(record["Names"], "web")
+        self.assertEqual(record["State"], "running")
 
     def _run_images(self, localrepo, *args):
         cli = self._cli(localrepo)
@@ -162,6 +170,84 @@ class DockerCompatOutputTestCase(TestCase):
         self.assertIn("1.00MB", out)
         out_quiet = self._run_images(localrepo, "-q")
         self.assertEqual(out_quiet.strip(), "aaa")
+        out_tmpl = self._run_images(localrepo, "--format",
+                                    "{{.Repository}}:{{.Tag}} {{.ID}}")
+        self.assertEqual(out_tmpl.strip(), "busybox:latest aaa")
+        out_json = self._run_images(localrepo, "--format", "json")
+        record = json.loads(out_json)
+        self.assertEqual(record["Repository"], "busybox")
+        self.assertEqual(record["Tag"], "latest")
+        self.assertEqual(record["ID"], "aaa")
+
+    def test_05_inspect(self):
+        """Test05 inspect prints docker-shaped JSON and templates"""
+        from udocker.container.localrepo import LocalRepository
+        repo = LocalRepository(self.base)
+        self.assertTrue(repo.create_repo())
+        cid = "cafe1234-0000-0000-0000-000000000000"
+        container_dir = os.path.join(self.base, "containers", cid)
+        os.makedirs(os.path.join(container_dir, "ROOT"))
+        with open(os.path.join(container_dir, "container.json"), "w") as fp:
+            json.dump({"config": {"Cmd": ["sh"], "Env": ["A=1"]},
+                       "created": "2026-01-01T00:00:00Z"}, fp)
+        with open(os.path.join(container_dir, "state.json"), "w") as fp:
+            json.dump({"status": "exited", "exitcode": 7,
+                       "timestamp": "2026-11-10T10:00:00Z",
+                       "ports": []}, fp)
+        with open(os.path.join(container_dir, "cmd.json"), "w") as fp:
+            json.dump({"entrypoint": [], "cmd": ["echo", "hi"]}, fp)
+        with open(os.path.join(container_dir, "volumes.json"), "w") as fp:
+            json.dump(["vol1:/data"], fp)
+        self.assertTrue(repo.create_volume("vol1"))
+        self.assertTrue(repo.set_container_name(cid, "web"))
+        cli = self._cli(repo)
+        cmdp = CmdParser()
+        cmdp.parse(["udocker", "inspect", cid])
+        with patch('udocker.cli.Msg') as mock_msg:
+            self.assertEqual(cli.do_inspect(cmdp), 0)
+        data = json.loads(mock_msg.return_value.out.call_args[0][0])
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["Id"], cid)
+        self.assertEqual(data[0]["Name"], "/web")
+        self.assertEqual(data[0]["State"]["Status"], "exited")
+        self.assertEqual(data[0]["State"]["ExitCode"], 7)
+        self.assertEqual(data[0]["Config"]["Cmd"], ["echo", "hi"])
+        self.assertEqual(data[0]["Mounts"][0]["Type"], "volume")
+        self.assertEqual(data[0]["Mounts"][0]["Name"], "vol1")
+        self.assertEqual(data[0]["HostConfig"]["NetworkMode"], "host")
+        cmdp = CmdParser()
+        cmdp.parse(["udocker", "inspect", "-f", "{{.State.ExitCode}}",
+                    "--type=container", cid])
+        with patch('udocker.cli.Msg') as mock_msg:
+            self.assertEqual(cli.do_inspect(cmdp), 0)
+        self.assertEqual(mock_msg.return_value.out.call_args[0][0], "7")
+
+    def test_06_info_and_version(self):
+        """Test06 info and version print docker fields and templates"""
+        from udocker import __version__
+        localrepo = Mock()
+        localrepo.get_containers_list.return_value = []
+        localrepo.get_imagerepos.return_value = []
+        localrepo.get_volumes_list.return_value = []
+        cli = self._cli(localrepo)
+        for argv in (["udocker", "info"], ["udocker", "version"]):
+            cmdp = CmdParser()
+            cmdp.parse(argv)
+            with patch('udocker.cli.Msg') as mock_msg:
+                self.assertEqual(getattr(cli, "do_" + argv[1])(cmdp), 0)
+            self.assertTrue(mock_msg.return_value.out.called)
+        cmdp = CmdParser()
+        cmdp.parse(["udocker", "info", "-f", "{{.ServerVersion}}"])
+        with patch('udocker.cli.Msg') as mock_msg:
+            self.assertEqual(cli.do_info(cmdp), 0)
+        self.assertEqual(mock_msg.return_value.out.call_args[0][0],
+                         __version__)
+        cmdp = CmdParser()
+        cmdp.parse(["udocker", "version", "-f", "{{.Server.Version}}"])
+        with patch('udocker.cli.Msg') as mock_msg:
+            self.assertEqual(cli.do_version(cmdp), 0)
+        self.assertEqual(mock_msg.return_value.out.call_args[0][0],
+                         __version__)
 
 
     def test_04_generated_name(self):
