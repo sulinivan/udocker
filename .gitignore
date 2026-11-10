@@ -123,3 +123,9 @@ udocker/udocker
 
 # DSH project skills (local, not part of udocker)
 /.agents/
+
+# Local test workspaces and agent artifacts (not part of udocker)
+/.manual-test/
+/replica/
+/CONTINUITY.md
+/state.json
