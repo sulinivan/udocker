@@ -847,7 +847,7 @@ def _udocker(args, stream=False):
 
 def list_containers():
     """Return the containers of the repository as parsed JSON records"""
-    (status, output) = _udocker(["ps", "--format=json"])
+    (status, output) = _udocker(["ps", "-a", "--format=json"])
     if status != 0:
         raise ComposeError("cannot list containers: %s" % output.strip())
     try:

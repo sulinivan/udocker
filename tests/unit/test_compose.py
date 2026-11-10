@@ -85,7 +85,7 @@ class FakeUdocker(object):
         self.calls.append(list(argv))
         args = list(argv[4:])
         text = ""
-        if args[:2] == ["ps", "--format=json"]:
+        if args[:3] == ["ps", "-a", "--format=json"]:
             text = json.dumps(self.containers)
         elif args and args[0] == "logs":
             text = self.logs.get(args[-1], "")
@@ -397,7 +397,7 @@ class ComposeCommandTestCase(TestCase):
                          [sys.executable, "-m", "udocker.maincmd",
                           "--repo=" + Config.conf["topdir"]])
         commands = fake.commands()
-        self.assertEqual(commands[0], ["ps", "--format=json"])
+        self.assertEqual(commands[0], ["ps", "-a", "--format=json"])
         self.assertEqual(commands[1], ["create", "--name=other_db_1",
                                        "busybox:latest"])
         self.assertEqual(commands[2], ["run", "-d", "other_db_1",
@@ -457,7 +457,7 @@ class ComposeCommandTestCase(TestCase):
         self.assertEqual(commands[0],
                          ["build", "-t=myproj_app:latest", "--force",
                           os.path.join(self.base, "app")])
-        self.assertEqual(commands[1], ["ps", "--format=json"])
+        self.assertEqual(commands[1], ["ps", "-a", "--format=json"])
         self.assertEqual(commands[2], ["rm", "-f", "myproj_app_1"])
         self.assertEqual(commands[3], ["create", "--name=myproj_app_1",
                                        "myproj_app:latest"])
@@ -489,7 +489,7 @@ class ComposeCommandTestCase(TestCase):
             ["down", "--file=" + self.path], fake)
         self.assertEqual(status, 0)
         commands = fake.commands()
-        self.assertEqual(commands[0], ["ps", "--format=json"])
+        self.assertEqual(commands[0], ["ps", "-a", "--format=json"])
         self.assertIn(["stop", "myproj_web_1"], commands)
         self.assertIn(["rm", "-f", "myproj_web_1"], commands)
         self.assertIn(["stop", "myproj_db_1"], commands)

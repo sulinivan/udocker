@@ -729,6 +729,7 @@ class ExecutionEngineCommonTestCase(TestCase):
         """Test22 ExecutionEngineCommon()._run_banner()."""
         mock_base.return_value = "ls"
         ex_eng = ExecutionEngineCommon(self.local, self.xmode)
+        ex_eng.opt["nobanner"] = False
         ex_eng._run_banner("/bin/bash")
         ex_eng.container_id = "CONTAINERID"
         self.assertTrue(mock_msg.called)

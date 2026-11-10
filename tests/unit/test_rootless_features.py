@@ -209,7 +209,7 @@ class RootlessFeaturesTestCase(TestCase):
                          "Interrupted")
 
     def test_09_ps_json(self):
-        """Test09 ps --format=json emits the container state as JSON"""
+        """Test09 ps -a --format=json emits every container as JSON"""
         base = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, base)
         container_dir = self._container_dir(
@@ -223,7 +223,7 @@ class RootlessFeaturesTestCase(TestCase):
         localrepo.get_size.return_value = 1024
         cli = self._cli(localrepo)
         cmdp = CmdParser()
-        cmdp.parse(["udocker", "ps", "--format=json"])
+        cmdp.parse(["udocker", "ps", "-a", "--format=json"])
         with patch('udocker.cli.Msg') as mock_msg, \
                 patch('udocker.cli.ExecutionMode') as mock_exec, \
                 patch('udocker.cli.ContainerStructure') as mock_structure:

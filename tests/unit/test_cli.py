@@ -742,7 +742,8 @@ class UdockerCLITestCase(TestCase):
         udoc = UdockerCLI(self.local)
         status = udoc.do_create(cmdp)
         self.assertEqual(status, 0)
-        self.assertFalse(self.local.set_container_name.called)
+        self.assertTrue(self.local.set_container_name.called)
+        self.assertIn("_", self.local.set_container_name.call_args[0][1])
 
         argv = ["udocker", "create", "--name=mycont", "ipyrad:latest"]
         cmdp = CmdParser()

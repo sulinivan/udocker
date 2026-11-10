@@ -57,7 +57,7 @@ class ExecutionEngineCommon(object):
     opt["portsmap"] = []             # Ports mapped in container
     opt["portsexp"] = []             # Ports exposed by container
     opt["devices"] = []              # Devices passed to container
-    opt["nobanner"] = False          # Printing of startup banner
+    opt["nobanner"] = True           # Printing of startup banner (opt-in)
     opt["dns"] = []                  # DNS servers for the container
     opt["dnssearch"] = []            # DNS search domains
     opt["tty"] = False               # Allocate a pseudo terminal

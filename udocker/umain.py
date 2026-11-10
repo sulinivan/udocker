@@ -10,6 +10,85 @@ from udocker.container.localrepo import LocalRepository
 from udocker.cli import UdockerCLI
 
 
+# docker command groups and their udocker equivalents. The group syntax is
+# rewritten before parsing, so every flag of the target command keeps working.
+COMPAT_GROUPS = {
+    "container": {
+        "ls": ["ps"], "list": ["ps"], "ps": ["ps"],
+        "run": ["run"], "create": ["create"], "start": ["start"],
+        "stop": ["stop"], "restart": ["restart"], "kill": ["kill"],
+        "rm": ["rm"], "remove": ["rm"], "exec": ["exec"],
+        "logs": ["logs"], "inspect": ["inspect"], "top": ["top"],
+        "stats": ["stats"], "port": ["port"], "diff": ["diff"],
+        "wait": ["wait"], "commit": ["commit"], "cp": ["cp"],
+        "rename": ["rename"],
+    },
+    "image": {
+        "ls": ["images"], "list": ["images"], "pull": ["pull"],
+        "push": ["push"], "rm": ["rmi"], "remove": ["rmi"],
+        "tag": ["tag"], "inspect": ["inspect"],
+        "history": ["history"], "save": ["save"], "load": ["load"],
+        "import": ["import"], "export": ["export"],
+        "build": ["build"], "prune": ["image", "prune"],
+        "manifest": ["manifest"],
+    },
+    "system": {
+        "df": ["system", "df"], "prune": ["system", "prune"],
+    },
+}
+
+
+# short options that are always boolean, safe to split out of a combined
+# group such as -aq or -it
+SHORT_FLAGS = "aqitdmslDPTV"
+
+
+def expand_short_flags(argv):
+    """Expand combined boolean short options: -aq -> -a -q"""
+    result = [argv[0]]
+    command_seen = False
+    options_region = False
+    for token in argv[1:]:
+        if not command_seen:
+            result.append(token)
+            if not token.startswith("-"):
+                command_seen = True
+                options_region = True
+            continue
+        combined = (options_region and token.startswith("-") and
+                    not token.startswith("--") and len(token) > 2 and
+                    "=" not in token and
+                    all(char in SHORT_FLAGS for char in token[1:]))
+        if combined:
+            result.extend("-" + char for char in token[1:])
+            continue
+        result.append(token)
+        if options_region and not token.startswith("-"):
+            options_region = False
+    return result
+
+
+def expand_compat_argv(argv):
+    """Rewrite docker group syntax, e.g. 'container ls', to udocker commands"""
+    for index in range(1, len(argv)):
+        token = argv[index]
+        if token.startswith("-"):
+            continue
+        group = COMPAT_GROUPS.get(token)
+        if group is None:
+            return argv
+        if index + 1 >= len(argv):
+            return argv
+        subcmd = argv[index + 1]
+        if subcmd in ("-h", "--help", "help"):
+            return argv[:index] + ["help"]
+        target = group.get(subcmd)
+        if target is None:
+            return argv
+        return argv[:index] + target + argv[index + 2:]
+    return argv
+
+
 class UMain(object):
     """These methods correspond directly to the commands that can
     be invoked via the command line interface.
@@ -68,6 +147,7 @@ class UMain(object):
 
     def execute(self):
         """Command parsing and selection"""
+        self.argv = expand_short_flags(expand_compat_argv(self.argv))
         self._prepare_exec()
         cmds = {
             "search": self.cli.do_search, "help": self.cli.do_help,

@@ -5,9 +5,11 @@ import os
 import sys
 import string
 import json
+import random
 import shutil
 import socket
 import time
+import calendar
 from getpass import getpass
 
 from udocker import __version__
@@ -41,6 +43,179 @@ else:
     BUILTIN = "__builtin__"
     # Xpylint: disable=undefined-variable
     GET_INPUT = raw_input
+
+
+def _parse_timestamp(timestamp):
+    """Epoch seconds of an ISO-8601 UTC timestamp, None if unparsable"""
+    if not isinstance(timestamp, str) or len(timestamp) < 19:
+        return None
+    try:
+        parsed = time.strptime(timestamp[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    return calendar.timegm(parsed)
+
+
+def _human_duration(seconds):
+    """Docker style duration: 3 minutes, 2 hours, 5 days"""
+    seconds = max(int(seconds), 0)
+    for size, name in ((31536000, "year"), (2592000, "month"),
+                       (604800, "week"), (86400, "day"),
+                       (3600, "hour"), (60, "minute"), (1, "second")):
+        value = seconds // size
+        if value:
+            return "%d %s%s" % (value, name, "" if value == 1 else "s")
+    return "0 seconds"
+
+
+def _relative_time(timestamp):
+    """Human readable age of a timestamp, as docker prints it in CREATED"""
+    epoch = _parse_timestamp(timestamp)
+    if epoch is None:
+        return ""
+    return _human_duration(time.time() - epoch) + " ago"
+
+
+def _read_state(container_dir):
+    """Container state.json as a dict, empty when missing or invalid"""
+    if not isinstance(container_dir, (str, bytes)):
+        return {}
+    try:
+        with open(container_dir + "/state.json", "r") as filep:
+            state = json.load(filep)
+    except (IOError, OSError, ValueError, TypeError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _docker_status(container_dir, status):
+    """Docker style STATUS column of a container"""
+    if status == "Created":
+        return "Created"
+    state = _read_state(container_dir)
+    epoch = _parse_timestamp(state.get("timestamp", ""))
+    age = _human_duration(time.time() - epoch) if epoch else ""
+    if status == "Running":
+        if not age:
+            return "Up"
+        if age == "0 seconds":
+            return "Up Less than a second"
+        return "Up " + age
+    suffix = " " + age + " ago" if age else ""
+    if status == "Interrupted":
+        return "Exited (137)" + suffix
+    return status + suffix
+
+
+def _as_command_list(value):
+    """Normalize a Cmd/Entrypoint metadata value to a list of tokens"""
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if isinstance(value, str):
+        return value.split()
+    return []
+
+
+def _format_command(parts, no_trunc=False):
+    """COMMAND column text: quoted and truncated like docker"""
+    text = " ".join(parts)
+    if not text:
+        return ""
+    text = '"' + text + '"'
+    if not no_trunc and len(text) > 20:
+        text = text[:20]
+    return text
+
+
+def _container_command(container_dir, no_trunc=False):
+    """Docker style COMMAND column built from the container metadata"""
+    if not isinstance(container_dir, (str, bytes)):
+        return ""
+    try:
+        with open(container_dir + "/cmd.json", "r") as filep:
+            recorded = json.load(filep)
+    except (IOError, OSError, ValueError, TypeError):
+        recorded = None
+    if isinstance(recorded, dict):
+        parts = _as_command_list(recorded.get("entrypoint"))
+        parts.extend(_as_command_list(recorded.get("cmd")))
+        text = _format_command(parts, no_trunc)
+        if text:
+            return text
+    try:
+        with open(container_dir + "/container.json", "r") as filep:
+            data = json.load(filep)
+    except (IOError, OSError, ValueError, TypeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    meta = data.get("config") or data.get("container_config") or data
+    if not isinstance(meta, dict):
+        return ""
+    parts = (_as_command_list(meta.get("Entrypoint")) or
+             _as_command_list(meta.get("entrypoint")))
+    parts = list(parts)
+    parts.extend(_as_command_list(meta.get("Cmd")) or
+                 _as_command_list(meta.get("cmd")))
+    return _format_command(parts, no_trunc)
+
+
+def _docker_ports(ports):
+    """Docker style PORTS column from the recorded port mappings"""
+    result = []
+    for mapping in ports or []:
+        text = str(mapping)
+        parts = text.split(":")
+        if len(parts) == 2 and parts[0] and parts[1]:
+            port = parts[1]
+            proto = "tcp"
+            if "/" in port:
+                (port, proto) = port.split("/", 1)
+            result.append("0.0.0.0:%s->%s/%s" % (parts[0], port, proto))
+        else:
+            result.append(text)
+    return ", ".join(result)
+
+
+def _status_matches(status, wanted):
+    """Does a container status match a docker ps -f status= filter value"""
+    if wanted in ("running", "up"):
+        return status == "Running"
+    if wanted in ("exited", "dead"):
+        return status.startswith("Exited") or status == "Interrupted"
+    if wanted == "created":
+        return status == "Created"
+    if wanted == "paused":
+        return status == "Paused"
+    return False
+
+
+def _filter_match(container, filters):
+    """Apply docker ps --filter key=value items to one container record"""
+    for item in filters:
+        (key, separator, value) = str(item).partition("=")
+        if not separator:
+            return False
+        values = [entry for entry in value.split(",") if entry]
+        if key == "status":
+            if not any(_status_matches(container["status"], entry)
+                       for entry in values):
+                return False
+        elif key == "name":
+            names = container.get("name") or ""
+            if not any(entry in names for entry in values):
+                return False
+        elif key == "id":
+            if not any(container["container_id"].startswith(entry)
+                       for entry in values):
+                return False
+        elif key in ("ancestor", "image"):
+            image = container.get("image") or ""
+            if not any(entry in image for entry in values):
+                return False
+        else:
+            return False
+    return True
 
 
 class UdockerCLI(object):
@@ -358,6 +533,21 @@ class UdockerCLI(object):
         try:
             with open(container_dir + "/volumes.json", "w") as filep:
                 json.dump(list(volumes), filep)
+        except (IOError, OSError, ValueError, TypeError):
+            pass
+
+    @staticmethod
+    def _save_run_command(container_dir, opt):
+        """Remember the command of the last run for docker ps COMMAND"""
+        if not isinstance(container_dir, str):
+            return
+        data = {
+            "entrypoint": opt.get("entryp") or "",
+            "cmd": opt.get("cmd") or [],
+        }
+        try:
+            with open(container_dir + "/cmd.json", "w") as filep:
+                json.dump(data, filep)
         except (IOError, OSError, ValueError, TypeError):
             pass
 
@@ -831,6 +1021,22 @@ class UdockerCLI(object):
                 imagerepo, tag)
         return False
 
+    NAMES_ADJECTIVES = ("brave", "calm", "eager", "fancy", "gentle",
+                        "happy", "jolly", "keen", "lucid", "merry",
+                        "noble", "proud", "quick", "quiet", "vivid", "wise")
+    NAMES_NOUNS = ("bohr", "curie", "darwin", "euler", "fermi", "gauss",
+                   "hopper", "kepler", "lovelace", "noether", "pascal",
+                   "ritchie", "shannon", "turing", "volta", "wozniak")
+
+    def _generated_container_name(self):
+        """Docker style random container name (adjective_scientist)"""
+        for dummy in range(20):
+            name = "%s_%s" % (random.choice(self.NAMES_ADJECTIVES),
+                              random.choice(self.NAMES_NOUNS))
+            if not self.localrepo.get_container_id(name):
+                return name
+        return "container_" + Unique().imagename()
+
     def do_create(self, cmdp):
         """
         create: extract image layers and create a container
@@ -849,6 +1055,8 @@ class UdockerCLI(object):
                 return self.STATUS_ERROR
         container_id = self._create(imagespec)
         if container_id:
+            if not name:
+                name = self._generated_container_name()
             Msg().out(container_id)
             if name and not self.localrepo.set_container_name(container_id,
                                                               name):
@@ -967,6 +1175,10 @@ class UdockerCLI(object):
                 "fl": ("--nobanner",), "act": 'R',
                 "p2": "CMD_OPT", "p3": False
             },
+            "banner": {
+                "fl": ("--banner",), "act": 'R',
+                "p2": "CMD_OPT", "p3": False
+            },
             "platform": {
                 "fl": ("--platform=",), "act": 'R',
                 "p2": "CMD_OPT", "p3": False
@@ -989,6 +1201,9 @@ class UdockerCLI(object):
                 elif cmdp_args["act"] == "E":   # action is extend
                     exec_engine.opt[option].extend(option_value)
                 last_value = option_value
+        if exec_engine:
+            exec_engine.opt["nobanner"] = not bool(
+                exec_engine.opt.get("banner"))
 
     def do_run(self, cmdp):
         """
@@ -1016,7 +1231,7 @@ class UdockerCLI(object):
         --kernel=<kernel-id>       :simulate this Linux kernel version
         --device=/dev/xxx          :pass device to container (R1 mode only)
         --location=<container-dir> :use container outside the repository
-        --nobanner                 :don't print a startup banner
+        --banner                   :print the container startup banner
         --entrypoint               :override the container metadata entrypoint
         --platform=os/arch         :pull image for OS and architecture
         --pull=<when>              :when to pull (missing|never|always|reuse)
@@ -1069,6 +1284,7 @@ class UdockerCLI(object):
         else:
             if pull == "reuse" and name:
                 container_id = self.localrepo.get_container_id(name)
+            created = False
             if not container_id:
                 container_id = self.localrepo.get_container_id(container_or_image)
             if not container_id:
@@ -1076,13 +1292,17 @@ class UdockerCLI(object):
                 if (imagerepo and
                         self.localrepo.cd_imagerepo(imagerepo, tag)):
                     container_id = self._create(imagerepo + ":" + tag)
+                    created = bool(container_id)
                 if pull != "never" and (not container_id or pull == "always"):
                     self.do_pull(cmdp)
                     if self.localrepo.cd_imagerepo(imagerepo, tag):
                         container_id = self._create(imagerepo + ":" + tag)
+                        created = bool(container_id)
                     if not container_id:
                         Msg().err("Error: image or container not available")
                         return self.STATUS_ERROR
+            if created and not name:
+                name = self._generated_container_name()
             if name and container_id:
                 if not self.localrepo.set_container_name(container_id, name):
                     if pull != "reuse":
@@ -1105,6 +1325,7 @@ class UdockerCLI(object):
         if not self._expand_volumes_from(exec_engine):
             return self.STATUS_ERROR
         self._save_run_volumes(container_dir, opt.get("vol") or [])
+        self._save_run_command(container_dir, opt)
         if not self._expand_publish_all(exec_engine, container_id):
             return self.STATUS_ERROR
         portsmap = opt.get("portsmap") or []
@@ -1704,18 +1925,73 @@ class UdockerCLI(object):
         """compose: run a multi-container project (see: udocker compose help)"""
         return compose.do_compose(self, cmdp)
 
+    def _image_id(self):
+        """Docker image id of the image selected with cd_imagerepo()"""
+        manifest = self.localrepo.load_json("manifest")
+        if isinstance(manifest, dict):
+            config = manifest.get("config")
+            if isinstance(config, dict) and config.get("digest"):
+                return str(config["digest"])
+            layers = manifest.get("layers")
+            if isinstance(layers, list) and layers:
+                last = layers[-1]
+                if isinstance(last, dict) and last.get("digest"):
+                    return str(last["digest"])
+        ancestry = self.localrepo.load_json("ancestry")
+        if isinstance(ancestry, list) and ancestry:
+            return str(ancestry[-1])
+        return ""
+
+    def _image_row(self, imagerepo, tag, no_trunc=False):
+        """Docker style row of one image tag"""
+        self.localrepo.cd_imagerepo(imagerepo, tag)
+        layers_list = self.localrepo.get_layers(imagerepo, tag)
+        size = 0
+        for (dummy, layer_size) in layers_list:
+            size += layer_size
+        container_json = None
+        attrs = self.localrepo.get_image_attributes()
+        if isinstance(attrs, (list, tuple)) and attrs:
+            container_json = attrs[0]
+        created = ""
+        if isinstance(container_json, dict):
+            created = container_json.get("created", "") or ""
+        short_id = self._image_id()
+        if not short_id:
+            for (layer_path, dummy) in layers_list:
+                short_id = os.path.basename(str(layer_path))
+                if short_id.endswith(".layer"):
+                    short_id = short_id[:-len(".layer")]
+                if short_id:
+                    break
+        if short_id.startswith("sha256:"):
+            short_id = short_id[len("sha256:"):]
+        return {
+            "repository": imagerepo,
+            "tag": tag,
+            "image_id": short_id if no_trunc else short_id[:12],
+            "full_id": short_id,
+            "created": _relative_time(created) if created else "N/A",
+            "size": size,
+        }
+
     def do_images(self, cmdp):
         """
         images: list container images
         images [options]
-        -l                         :long format
-        -p                         :print platform
+        -q, --quiet                :only display image ids
+        -l                         :long format (udocker)
+        -p                         :print platform (udocker)
+        -a, --all                  :accepted for compatibility
+        --no-trunc                 :don't truncate the image id
         --format=json              :print the image list as JSON
         """
+        quiet = bool(cmdp.get("-q") or cmdp.get("--quiet"))
         verbose = cmdp.get("-l")
         print_platform = cmdp.get("-p")
+        no_trunc = bool(cmdp.get("--no-trunc"))
         output_format = cmdp.get("--format=")
-        dummy = cmdp.get("--no-trunc")
+        dummy = cmdp.get("-a")
         dummy = cmdp.get("--all")
         if cmdp.missing_options():               # syntax error
             return self.STATUS_ERROR
@@ -1740,43 +2016,68 @@ class UdockerCLI(object):
             Msg().out(json.dumps(images_json, sort_keys=True, indent=4))
             return self.STATUS_OK
 
-        Msg().out("REPOSITORY", l=Msg.INF)
+        if verbose or print_platform:
+            Msg().out("REPOSITORY", l=Msg.INF)
+            for (imagerepo, tag) in images_list:
+                prot = (".", "P")[
+                    self.localrepo.isprotected_imagerepo(imagerepo, tag)]
+                imagerepo_dir = self.localrepo.cd_imagerepo(imagerepo, tag)
 
-        for (imagerepo, tag) in images_list:
-            prot = (".", "P")[
-                self.localrepo.isprotected_imagerepo(imagerepo, tag)]
-            imagerepo_dir = self.localrepo.cd_imagerepo(imagerepo, tag)
+                if print_platform:
+                    platform = self.localrepo.get_image_platform_fmt()
+                    Msg().out("%-18.18s %c %s" %
+                              (platform, prot, imagerepo + ":" + tag))
+                else:
+                    Msg().out("%s    %c" % (imagerepo + ":" + tag, prot))
 
-            if print_platform:
-                platform = self.localrepo.get_image_platform_fmt()
-                Msg().out("%-18.18s %c %s" % (platform, prot, imagerepo + ":" + tag))
-            else:
-                Msg().out("%s    %c" % (imagerepo + ":" + tag, prot))
+                if verbose:
+                    Msg().out(" %s" % (imagerepo_dir))
+                    layers_list = self.localrepo.get_layers(imagerepo, tag)
+                    if layers_list:
+                        for (layer_name, size) in layers_list:
+                            file_size = size / (1024 * 1024)
+                            if not file_size and size:
+                                file_size = 1
+                            Msg().out("    %s (%d MB)" %
+                                      (layer_name.replace(imagerepo_dir, ""),
+                                       file_size))
+            return self.STATUS_OK
 
-            if verbose:
-                Msg().out(" %s" % (imagerepo_dir))
-                layers_list = self.localrepo.get_layers(imagerepo, tag)
-                if layers_list:
-                    for (layer_name, size) in layers_list:
-                        file_size = size / (1024 * 1024)
-                        if not file_size and size:
-                            file_size = 1
-                        Msg().out("    %s (%d MB)" %
-                                  (layer_name.replace(imagerepo_dir, ""),
-                                   file_size))
+        rows = [self._image_row(imagerepo, tag, no_trunc)
+                for (imagerepo, tag) in images_list]
+        if quiet:
+            for row in rows:
+                Msg().out(row["full_id"])
+            return self.STATUS_OK
+        Msg().out("%-30s %-20s %-12s %-20s %s" %
+                  ("REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE"))
+        for row in rows:
+            Msg().out("%-30s %-20s %-12s %-20s %s" % (
+                row["repository"] or "<none>", row["tag"] or "<none>",
+                row["image_id"] or "<none>", row["created"],
+                extras.format_size(row["size"])))
         return self.STATUS_OK
 
     def do_ps(self, cmdp):
         """
         ps: list containers
-        -m                         :print execution mode
-        -s                         :print size in MB
-        -p                         :print platform
+        -a, --all                  :show all containers (default: running)
+        -q, --quiet                :only display container ids
+        -f, --filter=<key=value>   :filter by status, name, id or ancestor
+        -s                         :show the container size
+        --no-trunc                 :don't truncate output
+        -m                         :print execution mode (udocker)
+        -p                         :print platform (udocker)
         --format=json              :print the container list as JSON
         """
+        show_all = bool(cmdp.get("-a") or cmdp.get("--all"))
+        quiet = bool(cmdp.get("-q") or cmdp.get("--quiet"))
+        no_trunc = bool(cmdp.get("--no-trunc"))
         print_mode = cmdp.get("-m")
         print_size = cmdp.get("-s")
         print_platform = cmdp.get("-p")
+        filters = list(cmdp.get("-f=", "CMD_OPT", True))
+        filters.extend(cmdp.get("--filter=", "CMD_OPT", True))
         output_format = cmdp.get("--format=")
         if cmdp.missing_options():               # syntax error
             return self.STATUS_ERROR
@@ -1788,6 +2089,15 @@ class UdockerCLI(object):
             supervisor.reconcile(container_dir)
             if isinstance(names, (list, tuple)):
                 names = ",".join(names)
+            status = self._container_status(container_dir)
+            if isinstance(container_dir, (str, bytes)):
+                try:
+                    created_epoch = os.path.getmtime(
+                        container_dir + "/container.json")
+                except (IOError, OSError, TypeError):
+                    created_epoch = 0.0
+            else:
+                created_epoch = 0.0
             containers.append({
                 "container_id": container_id,
                 "name": names,
@@ -1801,41 +2111,92 @@ class UdockerCLI(object):
                 "platform": ContainerStructure(
                     self.localrepo,
                     container_id).get_container_platform_fmt(),
-                "status": self._container_status(container_dir),
+                "status": status,
+                "docker_status": _docker_status(container_dir, status),
+                "command": _container_command(container_dir, no_trunc),
+                "created": (_human_duration(time.time() - created_epoch) +
+                            " ago" if created_epoch else ""),
+                "created_epoch": created_epoch,
+                "ports": _docker_ports(_read_state(container_dir).get("ports")),
             })
 
+        status_filter = [item.split("=", 1)[1] for item in filters
+                         if item.startswith("status=")]
+        selected = []
+        for container in containers:
+            if (not show_all and not status_filter and
+                    container["status"] != "Running"):
+                continue
+            if filters and not _filter_match(container, filters):
+                continue
+            selected.append(container)
+        selected.sort(key=lambda item: item.get("created_epoch", 0),
+                      reverse=True)
+
         if output_format == "json":
-            Msg().out(json.dumps(containers, sort_keys=True, indent=4))
+            Msg().out(json.dumps(selected, sort_keys=True, indent=4))
             return self.STATUS_OK
 
-        mod_h = size_h = plat_h = ""
-        mod_l = size_l = plat_l = "%0s"
-        if print_mode:
-            mod_h = "MOD "
-            mod_l = "%2.2s "
+        if quiet:
+            for container in selected:
+                Msg().out(container["container_id"])
+            return self.STATUS_OK
+
+        if print_mode or print_platform:
+            # legacy udocker table, kept for the native flags
+            mod_h = size_h = plat_h = ""
+            mod_l = size_l = plat_l = "%0s"
+            if print_mode:
+                mod_h = "MOD "
+                mod_l = "%2.2s "
+            if print_size:
+                size_h = "SIZE "
+                size_l = "%5.5s "
+            if print_platform:
+                plat_h = "PLATFORM           "
+                plat_l = "%-18.18s "
+            fmt = ("%-36.36s %c %c " + mod_h + size_h + plat_h +
+                   "%-12.12s %-18s %-20.20s")
+            Msg().out(fmt % ("CONTAINER ID", 'P', 'M', "STATUS", "NAMES",
+                             "IMAGE"))
+            fmt = ("%-36.36s %c %c " + mod_l + size_l + plat_l +
+                   "%-12.100s %-18.100s %-20.100s")
+            for container in selected:
+                line = [''] * 9
+                line[0] = container["container_id"]
+                line[1] = ('.', 'P')[container["protected"]]
+                line[2] = ('R', 'W', 'N', 'D')[container["writable"]]
+                line[3] = container["mode"] if print_mode else ""
+                line[4] = container["size"] if print_size else ""
+                line[5] = container["platform"] if print_platform else ""
+                line[6] = container["status"]
+                line[7] = container["name"]
+                line[8] = container["image"]
+                Msg().out(fmt % tuple(line))
+            return self.STATUS_OK
+
+        # docker ps table
+        header = ("CONTAINER ID", "IMAGE", "COMMAND", "CREATED", "STATUS",
+                  "PORTS", "NAMES")
+        fmt = "%-14s %-24s %-22s %-20s %-22s %-24s %s"
         if print_size:
-            size_h = "SIZE "
-            size_l = "%5.5s "
-        if print_platform:
-            plat_h = "PLATFORM           "
-            plat_l = "%-18.18s "
-        fmt = ("%-36.36s %c %c " + mod_h + size_h + plat_h +
-               "%-12.12s %-18s %-20.20s")
-        Msg().out(fmt % ("CONTAINER ID", 'P', 'M', "STATUS", "NAMES", "IMAGE"))
-        fmt = ("%-36.36s %c %c " + mod_l + size_l + plat_l +
-               "%-12.100s %-18.100s %-20.100s")
-        for container in containers:
-            line = [''] * 9
-            line[0] = container["container_id"]
-            line[1] = ('.', 'P')[container["protected"]]
-            line[2] = ('R', 'W', 'N', 'D')[container["writable"]]
-            line[3] = container["mode"] if print_mode else ""
-            line[4] = container["size"] if print_size else ""
-            line[5] = container["platform"] if print_platform else ""
-            line[6] = container["status"]
-            line[7] = container["name"]
-            line[8] = container["image"]
-            Msg().out(fmt % tuple(line))
+            fmt += "   %10s"
+            header = header + ("SIZE",)
+        Msg().out(fmt % header)
+        for container in selected:
+            container_id = container["container_id"]
+            if not no_trunc:
+                container_id = container_id[:12]
+            size = container["size"]
+            if not size or size < 0:
+                size = 0
+            line = (container_id, container["image"] or "<none>",
+                    container["command"], container["created"],
+                    container["docker_status"], container["ports"],
+                    container["name"])
+            if print_size:
+                line = line + (extras.format_size(size * 1024 * 1024),)
+            Msg().out(fmt % line)
         return self.STATUS_OK
 
     def do_rm(self, cmdp):
@@ -2623,6 +2984,11 @@ General options common to all commands must appear before the command:
 Commands:
   --help [command]              :Command specific help
   showconf                      :Print all configuration options
+
+Docker-style command groups are accepted and translated:
+  container ls|run|rm|...       :same as ps, run, rm, ...
+  image ls|inspect|rm|...       :same as images, inspect, rmi, ...
+  system df|prune               :same as system df|prune
 
   search <repo/expression>      :Search dockerhub for container images
   pull <repo/image:tag>         :Pull container image from dockerhub

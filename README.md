@@ -13,7 +13,10 @@
 > this branch adds registry v2 push, `commit`/`cp`/`history`, the
 > detached-container lifecycle, the `extras` commands (`top`, `stats`,
 > `diff`, `port`, `system`, `prune`), `udocker compose` and named volumes
-> (`volume`, `-v name:/path`, compose `volumes:`).
+> (`volume`, `-v name:/path`, compose `volumes:`). The branch also targets
+> drop-in Docker CLI compatibility: docker command groups, docker-style
+> `ps`/`images` output and defaults (no banner, auto-generated names,
+> running-only `ps`); features that need root or a daemon are excluded.
 
 ![logo](docs/logo-small.png)
 
