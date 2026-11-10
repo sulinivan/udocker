@@ -12,7 +12,8 @@
 > [PR #461](https://github.com/indigo-dc/udocker/pull/461). On top of that PR
 > this branch adds registry v2 push, `commit`/`cp`/`history`, the
 > detached-container lifecycle, the `extras` commands (`top`, `stats`,
-> `diff`, `port`, `system`, `prune`) and `udocker compose`.
+> `diff`, `port`, `system`, `prune`), `udocker compose` and named volumes
+> (`volume`, `-v name:/path`, compose `volumes:`).
 
 ![logo](docs/logo-small.png)
 

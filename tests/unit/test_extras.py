@@ -412,6 +412,7 @@ class ExtrasTestCase(TestCase):
         localrepo.cd_container.side_effect = lambda cid: os.path.join(
             self.base, cid)
         localrepo.get_size.return_value = 2
+        localrepo.get_volumes_list.return_value = []
         status, out, dummy = self._capture(extras.print_system_df, localrepo)
         self.assertEqual(status, 0)
         lines = out.splitlines()

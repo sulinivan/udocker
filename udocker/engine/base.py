@@ -154,8 +154,29 @@ class ExecutionEngineCommon(object):
             return True
         return False
 
+    def _resolve_named_volumes(self):
+        """Replace named volumes with their host pathname.
+
+        A volume source without a leading slash is a named volume, as in
+        docker -v name:/path. The volume is created when missing. The
+        resolved host path is an ordinary directory inside the repository,
+        so every execution mode mounts it as a plain bind mount.
+        """
+        for index in range(len(self.opt["vol"])):
+            (host_path, cont_path) = Uvolume(self.opt["vol"][index]).split()
+            if not host_path or host_path.startswith('/'):
+                continue
+            if not self.localrepo.create_volume(host_path):
+                Msg().err("Error: invalid volume name:", host_path)
+                return False
+            self.opt["vol"][index] = "%s:%s" % (
+                self.localrepo.get_volume_path(host_path), cont_path)
+        return True
+
     def _check_volumes(self):
         """Check volume paths"""
+        if not self._resolve_named_volumes():
+            return False
         for vol in list(self.opt["vol"]):
             (host_path, cont_path) = Uvolume(vol).split()
             if not (host_path and host_path.startswith('/')):

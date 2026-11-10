@@ -379,6 +379,9 @@ class ComposeFile(object):
         services = raw.get("services")
         if not isinstance(services, dict) or not services:
             raise ComposeError("%s: no services defined" % filename)
+        volumes = raw.get("volumes")
+        if volumes is not None and not isinstance(volumes, dict):
+            raise ComposeError("%s: volumes must be a mapping" % filename)
         self.path = filename
         self.raw = raw
         return raw
@@ -395,6 +398,13 @@ class ComposeFile(object):
     def services(self):
         """Return the services mapping"""
         return self.raw.get("services") or OrderedDict()
+
+    def volume_defs(self):
+        """Top-level named volume declarations"""
+        volumes = self.raw.get("volumes")
+        if isinstance(volumes, dict):
+            return volumes
+        return OrderedDict()
 
 
 def normalize_name(value):
@@ -481,12 +491,14 @@ def parse_ports(value):
     return result
 
 
-def parse_volumes(value, compose_dir):
+def parse_volumes(value, compose_dir, project="", volume_defs=None):
     """Normalize volumes to a list of host:container bind mounts.
 
     Relative bind paths are resolved against the compose file directory.
-    A named volume has no rootless equivalent, so it is mapped to a
-    directory named after the volume in the project directory.
+    A source without a path separator is a named volume: it is mapped to an
+    udocker named volume, prefixed with the project name like docker
+    compose does, unless the top-level declaration sets name: or
+    external: true. The volume itself is created by the udocker run child.
     """
     result = []
     if value is None:
@@ -505,11 +517,26 @@ def parse_volumes(value, compose_dir):
             if host.startswith("."):
                 host = os.path.normpath(os.path.join(compose_dir, host))
             else:
-                _warn("named volume mapped to a project directory: %s"
-                      % spec)
-                host = os.path.join(compose_dir, host)
+                host = volume_name(project, host, volume_defs)
         result.append("%s:%s" % (host, container))
     return result
+
+
+def volume_name(project, source, volume_defs=None):
+    """Name of the udocker volume serving a compose named volume"""
+    if not isinstance(volume_defs, dict):
+        volume_defs = {}
+    if source not in volume_defs:
+        _warn("volume %s is not declared in the top-level volumes,"
+              " using %s_%s" % (source, project, source))
+    declared = volume_defs.get(source)
+    definition = declared if isinstance(declared, dict) else {}
+    explicit = definition.get("name")
+    if definition.get("external"):
+        return str(explicit or source)
+    if explicit:
+        return str(explicit)
+    return "%s_%s" % (project, source)
 
 
 def parse_labels(value):
@@ -552,7 +579,8 @@ def _build_config(value, service):
     return None
 
 
-def normalize_service(project, service, config, compose_dir):
+def normalize_service(project, service, config, compose_dir,
+                      volume_defs=None):
     """Return a normalized description of one service.
 
     Unknown keys are reported and ignored instead of failing the project,
@@ -586,7 +614,8 @@ def normalize_service(project, service, config, compose_dir):
         "entrypoint": parse_command(config.get("entrypoint")),
         "environment": parse_environment(config.get("environment")),
         "ports": parse_ports(config.get("ports")),
-        "volumes": parse_volumes(config.get("volumes"), compose_dir),
+        "volumes": parse_volumes(config.get("volumes"), compose_dir,
+                                 project, volume_defs),
         "working_dir": str(config.get("working_dir") or ""),
         "user": str(config.get("user") or ""),
         "labels": parse_labels(config.get("labels")),
@@ -683,8 +712,31 @@ class ComposeProject(object):
             if service not in self.services:
                 raise ComposeError("no such service: %s" % service)
             self._plans[service] = normalize_service(
-                self.name, service, self.services[service], self.dir)
+                self.name, service, self.services[service], self.dir,
+                self.volume_defs())
         return self._plans[service]
+
+    def volume_defs(self):
+        """Top-level named volume declarations"""
+        return self.file.volume_defs()
+
+    def volume_names(self):
+        """Mapping of compose volume keys to udocker volume names"""
+        declared = self.volume_defs()
+        result = OrderedDict()
+        for source in declared:
+            result[str(source)] = volume_name(self.name, source, declared)
+        return result
+
+    def external_volumes(self):
+        """Names of the volumes declared external"""
+        declared = self.volume_defs()
+        result = []
+        for source in declared:
+            definition = declared.get(source)
+            if isinstance(definition, dict) and definition.get("external"):
+                result.append(volume_name(self.name, source, declared))
+        return result
 
     def container_name(self, service):
         """Container name of a service"""
@@ -939,6 +991,11 @@ def _cmd_up(cli, args):
     """compose up: build, create and start the project"""
     (options, rest) = parse_options(args, UP_FLAGS, FILE_OPTIONS)
     project = _load_project(options)
+    for name in project.external_volumes():
+        if not os.path.isdir(os.path.join(str(Config.conf["topdir"]),
+                                          "volumes", name, "_data")):
+            Msg().err("Error: external volume does not exist:", name)
+            return cli.STATUS_ERROR
     order = project.order(project.select(rest))
     if options.get("--build"):
         for service in order:
@@ -1001,7 +1058,7 @@ def _cmd_up(cli, args):
 def _cmd_down(cli, args):
     """compose down: stop and remove the project containers"""
     (options, dummy) = parse_options(
-        args, ("--remove-orphans", "--rmi"), FILE_OPTIONS)
+        args, ("--remove-orphans", "--rmi", "-v", "--volumes"), FILE_OPTIONS)
     project = _load_project(options)
     index = container_index(list_containers())
     names = list(project.names().values())
@@ -1025,6 +1082,16 @@ def _cmd_down(cli, args):
             (result, dummy) = _udocker(["rmi", image])
             if result != 0:
                 _warn("cannot remove image: %s" % image)
+    if options.get("-v") or options.get("--volumes"):
+        declared = project.volume_defs()
+        for (source, name) in project.volume_names().items():
+            definition = declared.get(source)
+            if isinstance(definition, dict) and definition.get("external"):
+                continue
+            Msg().out("Info: removing volume: %s" % name, l=Msg.INF)
+            (result, dummy) = _udocker(["volume", "rm", "-f", name])
+            if result != 0:
+                _warn("cannot remove volume: %s" % name)
     return status
 
 
@@ -1122,8 +1189,9 @@ def do_compose(cli, cmdp):
       up [-d] [--build] [--force-recreate] [--remove-orphans] [services...]
                                 :create and start the services; without -d
                                  follow the logs and stop on Ctrl-C
-      down [--remove-orphans] [--rmi]
-                                :stop and delete the project containers
+      down [--remove-orphans] [--rmi] [-v]
+                                :stop and delete the project containers;
+                                 -v also removes the project named volumes
       ps [services...]          :list the project containers
       logs [-f] [--tail=<lines>] [services...]
                                 :print or follow the service logs (-f is
@@ -1138,7 +1206,9 @@ def do_compose(cli, cmdp):
     network stack, no health checks, restart policies or scaling; only tcp
     ports with a host port are published; images are not pulled; build
     sections are built with udocker build; labels are accepted but not
-    applied.
+    applied. Named volumes are supported: "name:/path" becomes the udocker
+    volume <project>_<name> unless the top-level volumes section sets name:
+    or external: true.
     """
     consume = getattr(cmdp, "consume_all", None)
     if consume is not None:

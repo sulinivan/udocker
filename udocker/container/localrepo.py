@@ -6,6 +6,7 @@ import re
 import sys
 import stat
 import json
+import time
 
 from udocker.genstr import is_genstr
 from udocker.config import Config
@@ -40,6 +41,7 @@ class LocalRepository(object):
         self.reposdir = Config.conf['reposdir']
         self.layersdir = Config.conf['layersdir']
         self.containersdir = Config.conf['containersdir']
+        self.volumesdir = Config.conf['volumesdir']
         self.homedir = Config.conf['homedir']
 
         if not self.bindir:
@@ -54,6 +56,8 @@ class LocalRepository(object):
             self.layersdir = self.topdir + "/layers"
         if not self.containersdir:
             self.containersdir = self.topdir + "/containers"
+        if not self.volumesdir:
+            self.volumesdir = self.topdir + "/volumes"
 
         self.cur_repodir = ""
         self.cur_tagdir = ""
@@ -162,6 +166,125 @@ class LocalRepository(object):
             return int(size)
         except (ValueError, NameError, AttributeError):
             return -1
+
+    #
+    # Named volumes. Rootless equivalent of docker volumes: a directory
+    # tree inside the repository, ordered by name, mounted into the
+    # container by the execution engine.
+    #
+
+    def volume_name_valid(self, name):
+        """Is name a valid docker-like volume name"""
+        if not is_genstr(name):
+            return False
+        return bool(re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$", name))
+
+    def get_volume_dir(self, name):
+        """Directory holding the metadata and the data of a volume"""
+        return self.volumesdir + "/" + name
+
+    def get_volume_path(self, name):
+        """Host pathname mounted into containers for a named volume"""
+        return self.get_volume_dir(name) + "/_data"
+
+    def is_volume(self, name):
+        """Does the named volume exist"""
+        if not self.volume_name_valid(name):
+            return False
+        return os.path.isdir(self.get_volume_path(name))
+
+    def get_volumes_list(self):
+        """Sorted names of the existing named volumes"""
+        try:
+            names = os.listdir(self.volumesdir)
+        except (IOError, OSError):
+            return []
+        return sorted(name for name in names if self.is_volume(name))
+
+    def create_volume(self, name, labels=None):
+        """Create a named volume, idempotent like docker"""
+        if not self.volume_name_valid(name):
+            return False
+        volume_dir = self.get_volume_dir(name)
+        data_dir = self.get_volume_path(name)
+        try:
+            if not os.path.exists(data_dir):
+                if not os.path.exists(volume_dir):
+                    os.makedirs(volume_dir)
+                os.makedirs(data_dir)
+                self.save_json(volume_dir + "/volume.json", {
+                    "created": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                             time.gmtime()),
+                    "labels": labels or {},
+                })
+        except (IOError, OSError):
+            return False
+        return True
+
+    def get_volume(self, name):
+        """Docker-like metadata of a named volume, None if missing"""
+        if not self.is_volume(name):
+            return None
+        volume_dir = self.get_volume_dir(name)
+        meta = self.load_json(volume_dir + "/volume.json")
+        if not isinstance(meta, dict):
+            meta = {}
+        created = meta.get("created")
+        if not created:
+            try:
+                created = time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ",
+                    time.gmtime(os.path.getmtime(volume_dir)))
+            except (IOError, OSError):
+                created = ""
+        labels = meta.get("labels")
+        if not isinstance(labels, dict):
+            labels = {}
+        return {
+            "Name": name,
+            "Driver": "local",
+            "Mountpoint": self.get_volume_path(name),
+            "CreatedAt": created,
+            "Labels": labels,
+            "Scope": "local",
+        }
+
+    def del_volume(self, name):
+        """Remove a named volume and all of its data"""
+        if not self.volume_name_valid(name):
+            return False
+        volume_dir = self.get_volume_dir(name)
+        if not os.path.exists(volume_dir):
+            return False
+        return FileUtil(volume_dir).remove(force=True, recursive=True)
+
+    def get_volume_size(self, name):
+        """Size in MiB of the data of a named volume"""
+        try:
+            size, dummy = Uprocess().get_output(
+                ["du", "-s", "-m", "-x", self.get_volume_path(name)]).split()
+            return int(size)
+        except (ValueError, NameError, AttributeError):
+            return -1
+
+    def get_volume_containers(self, name):
+        """Ids of the containers whose volumes.json references the volume"""
+        result = []
+        volume_path = self.get_volume_path(name)
+        for item in self.get_containers_list(False):
+            container_id = item[0]
+            container_dir = self.cd_container(container_id)
+            if not container_dir:
+                continue
+            volumes = self.load_json(container_dir + "/volumes.json")
+            if not isinstance(volumes, list):
+                continue
+            for volume in volumes:
+                host_path = str(volume).split(":", 1)[0]
+                if host_path in (name, volume_path):
+                    result.append(container_id)
+                    break
+        return result
 
     def get_containers_list(self, dir_only=True):
         """Get a list of all containers in the local repo

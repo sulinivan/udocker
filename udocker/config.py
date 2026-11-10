@@ -26,6 +26,7 @@ class Config(object):
     conf['reposdir'] = None
     conf['layersdir'] = None
     conf['containersdir'] = None
+    conf['volumesdir'] = None
 
     # udocker installation tarball the release is the minimum requirement
     # the actual tarball used in the installation can have a higher version

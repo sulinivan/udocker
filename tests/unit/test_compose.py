@@ -299,14 +299,49 @@ class ComposeProjectTestCase(TestCase):
         self.assertIn("--env=B=2", args)
         self.assertIn("--publish=8080:80", args)
         self.assertNotIn("--publish=9000:90", args)
-        self.assertIn("--volume=%s:/var/lib" % os.path.join(self.base,
-                                                           "named"), args)
+        self.assertIn("--volume=myproj_named:/var/lib", args)
         self.assertIn("--volume=%s:/cache" % os.path.join(self.base,
                                                           "cache"), args)
         self.assertEqual(args[-3:], ["myproj_app_1", "echo", "hi"])
         self.assertLess(args.index("--env=A=1"), args.index("myproj_app_1"))
         self.assertIn("udp", errors.getvalue())
         self.assertIn("labels", errors.getvalue())
+
+    def test_09_named_volumes(self):
+        """Test09 named volumes: project prefix, name: and external:"""
+        text = (
+            "name: myproj\n"
+            "services:\n"
+            "  app:\n"
+            "    image: busybox:latest\n"
+            "    volumes:\n"
+            "      - data:/data\n"
+            "      - named:/named\n"
+            "      - ext:/ext\n"
+            "      - ./host:/host\n"
+            "volumes:\n"
+            "  data:\n"
+            "  named:\n"
+            "    name: elsewhere\n"
+            "  ext:\n"
+            "    external: true\n"
+        )
+        path = write_compose(self.base, text)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            project = compose.ComposeProject(path)
+            plan = project.plan("app")
+        self.assertEqual(plan["volumes"], [
+            "myproj_data:/data", "elsewhere:/named", "ext:/ext",
+            "%s:/host" % os.path.join(self.base, "host")])
+        self.assertEqual(list(project.volume_names().items()),
+                         [("data", "myproj_data"), ("named", "elsewhere"),
+                          ("ext", "ext")])
+        self.assertEqual(project.external_volumes(), ["ext"])
+        with contextlib.redirect_stderr(errors):
+            self.assertEqual(compose.parse_volumes(
+                ["nolabel:/x"], self.base, "p", {}), ["p_nolabel:/x"])
+        self.assertIn("not declared", errors.getvalue())
 
     def test_10_depends_on_order(self):
         """Test10 depends_on orders the services and catches cycles"""

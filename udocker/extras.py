@@ -734,6 +734,21 @@ def print_system_df(localrepo):
         else:
             containers_reclaim += size
 
+    volumes = localrepo.get_volumes_list()
+    volumes_active = 0
+    volumes_size = 0
+    volumes_reclaim = 0
+    for name in volumes:
+        size_mb = localrepo.get_volume_size(name)
+        if not size_mb or size_mb < 0:
+            size_mb = 0
+        size = size_mb * 1024 * 1024
+        volumes_size += size
+        if localrepo.get_volume_containers(name):
+            volumes_active += 1
+        else:
+            volumes_reclaim += size
+
     Msg().out(DF_FMT % ("TYPE", "TOTAL", "ACTIVE", "SIZE", "RECLAIMABLE"))
     Msg().out(DF_FMT % ("Images", str(len(tags)), str(images_active),
                         format_size(images_size),
@@ -741,7 +756,9 @@ def print_system_df(localrepo):
     Msg().out(DF_FMT % ("Containers", str(len(containers)),
                         str(containers_active), format_size(containers_size),
                         _reclaimable(containers_reclaim, containers_size)))
-    Msg().out(DF_FMT % ("Local Volumes", "0", "0", "0B", "0B"))
+    Msg().out(DF_FMT % ("Local Volumes", str(len(volumes)),
+                        str(volumes_active), format_size(volumes_size),
+                        _reclaimable(volumes_reclaim, volumes_size)))
     Msg().out(DF_FMT % ("Build Cache", "0", "0", "0B", "0B"))
     return STATUS_OK
 

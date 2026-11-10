@@ -18,6 +18,7 @@ from udocker.localfile import LocalFileAPI
 from udocker.helper.keystore import KeyStore
 from udocker.helper.hostinfo import HostInfo
 from udocker.helper.unshare import Unshare
+from udocker.helper.unique import Unique
 from udocker.container.structure import ContainerStructure
 from udocker.container.dockerfile import DockerfileParser, ContainerBuilder
 from udocker.engine.execmode import ExecutionMode
@@ -999,6 +1000,7 @@ class UdockerCLI(object):
         --user=userXX              :run as userXX
         --user=root                :run as root
         --volume=/data:/mnt        :mount host directory /data in /mnt
+        --volume=<name>:/mnt       :mount named volume <name> in /mnt
         --novol=/proc              :remove /proc from list of volumes to mount
         --env="MYTAG=xxx"          :set environment variable
         --env-file=<file>          :read environment variables from file
@@ -1539,6 +1541,164 @@ class UdockerCLI(object):
         if cmdp.missing_options():
             return self.STATUS_ERROR
         return extras.system_prune(self.localrepo, "all", force)
+
+    def do_volume(self, cmdp):
+        """
+        volume: manage named volumes
+        volume create [<name>]          :create a named volume
+        volume ls [--format=json]       :list named volumes
+        volume inspect <name> [<name>]  :print volume metadata as JSON
+        volume rm [-f] <name> [<name>]  :remove named volumes
+        volume prune [-f]               :remove volumes not used by containers
+        """
+        subcmd = cmdp.get("P1")
+        args = cmdp.get("P*") or []
+        args = args[1:]
+        force = ("-f" in args) or ("--force" in args)
+        names = [arg for arg in args if not arg.startswith("-")]
+        if subcmd == "create":
+            return self._volume_create(args)
+        if subcmd in ("ls", "list"):
+            return self._volume_ls("--format=json" in args)
+        if subcmd == "inspect":
+            return self._volume_inspect(names)
+        if subcmd == "rm":
+            return self._volume_rm(names, force)
+        if subcmd == "prune":
+            return self._volume_prune(force)
+        if not subcmd:
+            Msg().err("Error: volume requires a subcommand:"
+                      " create, ls, inspect, rm, prune")
+            return self.STATUS_ERROR
+        Msg().err("Error: unknown volume subcommand:", subcmd)
+        return self.STATUS_ERROR
+
+    def _volume_create(self, args):
+        """Create a named volume, like docker volume create"""
+        driver = ""
+        labels = {}
+        names = []
+        index = 0
+        while index < len(args):
+            arg = args[index]
+            if arg in ("-d", "--driver"):
+                index += 1
+                if index >= len(args):
+                    Msg().err("Error: option requires a value:", arg)
+                    return self.STATUS_ERROR
+                driver = args[index]
+            elif arg.startswith("--driver=") or arg.startswith("-d="):
+                driver = arg.split("=", 1)[1]
+            elif arg.startswith("--label="):
+                item = arg.split("=", 1)[1]
+                (key, sep, value) = item.partition("=")
+                if not sep or not key:
+                    Msg().err("Error: invalid label, expected key=value:",
+                              item)
+                    return self.STATUS_ERROR
+                labels[key] = value
+            elif arg.startswith("-"):
+                Msg().err("Error: unknown volume create option:", arg)
+                return self.STATUS_ERROR
+            else:
+                names.append(arg)
+            index += 1
+        if driver and driver != "local":
+            Msg().err("Error: only the local volume driver is available:",
+                      driver)
+            return self.STATUS_ERROR
+        if len(names) > 1:
+            Msg().err("Error: volume create accepts at most one name")
+            return self.STATUS_ERROR
+        name = names[0] if names else Unique().imagename()
+        if not self.localrepo.volume_name_valid(name):
+            Msg().err("Error: invalid volume name:", name)
+            return self.STATUS_ERROR
+        if not self.localrepo.create_volume(name, labels):
+            Msg().err("Error: cannot create volume:", name)
+            return self.STATUS_ERROR
+        Msg().out(name)
+        return self.STATUS_OK
+
+    def _volume_ls(self, as_json=False):
+        """List named volumes"""
+        volumes = [self.localrepo.get_volume(name)
+                   for name in self.localrepo.get_volumes_list()]
+        if as_json:
+            Msg().out(json.dumps(volumes, sort_keys=True))
+            return self.STATUS_OK
+        Msg().out("%-10s %s" % ("DRIVER", "VOLUME NAME"))
+        for volume in volumes:
+            Msg().out("%-10s %s" % (volume["Driver"], volume["Name"]))
+        return self.STATUS_OK
+
+    def _volume_inspect(self, names):
+        """Print the metadata of named volumes as JSON"""
+        if not names:
+            Msg().err("Error: volume inspect requires at least one name")
+            return self.STATUS_ERROR
+        volumes = []
+        for name in names:
+            volume = self.localrepo.get_volume(name)
+            if volume is None:
+                Msg().err("Error: no such volume:", name)
+                return self.STATUS_ERROR
+            volumes.append(volume)
+        Msg().out(json.dumps(volumes, indent=4, sort_keys=True))
+        return self.STATUS_OK
+
+    def _volume_rm(self, names, force=False):
+        """Remove named volumes, refusing volumes still in use"""
+        if not names:
+            Msg().err("Error: volume rm requires at least one name")
+            return self.STATUS_ERROR
+        status = self.STATUS_OK
+        for name in names:
+            if not self.localrepo.is_volume(name):
+                Msg().err("Error: no such volume:", name)
+                status = self.STATUS_ERROR
+                continue
+            in_use = self.localrepo.get_volume_containers(name)
+            if in_use and not force:
+                Msg().err("Error: volume is in use:", name,
+                          ",".join(in_use))
+                status = self.STATUS_ERROR
+                continue
+            if not self.localrepo.del_volume(name):
+                Msg().err("Error: cannot remove volume:", name)
+                status = self.STATUS_ERROR
+                continue
+            Msg().out(name)
+        return status
+
+    def _volume_prune(self, force=False):
+        """Remove the named volumes that no container references"""
+        unused = [name for name in self.localrepo.get_volumes_list()
+                  if not self.localrepo.get_volume_containers(name)]
+        if not unused:
+            Msg().out("Total reclaimed space: 0B")
+            return self.STATUS_OK
+        if not force:
+            answer = extras._confirm(                        # pylint: disable=protected-access
+                "WARNING! This will remove all volumes not used by any "
+                "container. Are you sure you want to continue? [y/N] ")
+            if answer is None:
+                Msg().err("Error: prune requires -f when stdin is not a "
+                          "terminal (use -f)")
+                return self.STATUS_ERROR
+            if not answer:
+                Msg().out("Aborted")
+                return self.STATUS_OK
+        Msg().out("Deleted Volumes:")
+        reclaimed = 0
+        for name in unused:
+            size = self.localrepo.get_volume_size(name)
+            if size and size > 0:
+                reclaimed += size * 1024 * 1024
+            Msg().out(name)
+            self.localrepo.del_volume(name)
+        Msg().out("Total reclaimed space: %s" % extras.format_size(reclaimed))
+        return self.STATUS_OK
 
     def do_compose(self, cmdp):
         """compose: run a multi-container project (see: udocker compose help)"""
@@ -2492,6 +2652,11 @@ Commands:
   system df                     :Show disk usage of images and containers
   system prune [-f]             :Remove stopped containers and unused images
   image prune [-f]              :Remove images not used by containers
+  volume create [<name>]        :Create a named volume
+  volume ls                     :List named volumes
+  volume inspect <name>         :Print volume metadata as JSON
+  volume rm [-f] <name>         :Remove named volumes
+  volume prune [-f]             :Remove volumes not used by containers
   cp <container>:<path> <host-path> :Copy files from container to host
   cp <host-path> <container>:<path> :Copy files from host to container
   name <container_id> <name>    :Give name to container
