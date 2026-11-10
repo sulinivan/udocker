@@ -358,6 +358,10 @@ class ComposeProjectTestCase(TestCase):
             "    env_file: ./app.env\n"
             "    environment:\n"
             "      B: from-compose\n"
+            "    stop_signal: SIGQUIT\n"
+            "    stop_grace_period: 1m30s\n"
+            "    networks: [backend]\n"
+            "    network_mode: host\n"
             "    ulimits:\n"
             "      nofile: 128\n"
             "      nproc:\n"
@@ -371,18 +375,25 @@ class ComposeProjectTestCase(TestCase):
             filep.write("A=file\nB=file-value\n# comment\n")
         os.environ.pop("COMPOSE_E2E_TAG", None)
         path = write_compose(self.base, text)
-        project = compose.ComposeProject(path)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            project = compose.ComposeProject(path)
+            plan = project.plan("app")
         self.assertNotIn("COMPOSE_E2E_TAG", os.environ)
-        plan = project.plan("app")
         self.assertEqual(plan["image"], "busybox:latest-from-env")
         self.assertIn("A=file", plan["environment"])
         self.assertIn("B=from-compose", plan["environment"])
         self.assertEqual(plan["ulimits"], ["nofile=128", "nproc=16:32"])
+        self.assertEqual(plan["stop_signal"], "SIGQUIT")
+        self.assertEqual(plan["stop_timeout"], 90)
+        self.assertNotIn("networks", errors.getvalue())
         args = compose.run_arguments(plan)
         self.assertIn("--env=A=file", args)
         self.assertIn("--env=B=from-compose", args)
         self.assertIn("--ulimit=nofile=128", args)
         self.assertIn("--ulimit=nproc=16:32", args)
+        self.assertIn("--stop-signal=SIGQUIT", args)
+        self.assertIn("--stop-timeout=90", args)
 
     def test_09_missing_env_file(self):
         """Test09 a missing env_file is a compose error"""

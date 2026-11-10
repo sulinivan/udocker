@@ -274,5 +274,62 @@ class DockerCompatOutputTestCase(TestCase):
         self.assertIn("_", name)
         self.assertGreater(len(name), 4)
 
+    def test_08_network(self):
+        """Test08 network ls/inspect and the root-only refusal"""
+        localrepo = Mock()
+        cli = self._cli(localrepo)
+        cmdp = CmdParser()
+        cmdp.parse(["udocker", "network", "ls"])
+        with patch('udocker.cli.Msg') as mock_msg:
+            self.assertEqual(cli.do_network(cmdp), 0)
+        out = "\n".join(str(call.args[0]) for call in
+                         mock_msg.return_value.out.call_args_list)
+        self.assertIn("NETWORK ID", out)
+        self.assertIn("host", out)
+        self.assertIn("none", out)
+        cmdp = CmdParser()
+        cmdp.parse(["udocker", "network", "ls", "--format", "json"])
+        with patch('udocker.cli.Msg') as mock_msg:
+            self.assertEqual(cli.do_network(cmdp), 0)
+        record = json.loads(
+            mock_msg.return_value.out.call_args_list[0][0][0])
+        self.assertEqual(record["Name"], "host")
+        self.assertEqual(record["Driver"], "host")
+        cmdp = CmdParser()
+        cmdp.parse(["udocker", "network", "inspect", "host"])
+        with patch('udocker.cli.Msg') as mock_msg:
+            self.assertEqual(cli.do_network(cmdp), 0)
+        data = json.loads(mock_msg.return_value.out.call_args[0][0])
+        self.assertEqual(data[0]["Name"], "host")
+        for subcmd in ("inspect", "create"):
+            cmdp = CmdParser()
+            if subcmd == "inspect":
+                cmdp.parse(["udocker", "network", "inspect", "nope"])
+            else:
+                cmdp.parse(["udocker", "network", "create", "foo"])
+            with patch('udocker.cli.Msg'):
+                self.assertEqual(cli.do_network(cmdp), 1)
+
+    def test_09_stop_signal(self):
+        """Test09 stop uses the signal and timeout recorded by run"""
+        container_dir = self._container_dir(
+            "stop1", {"status": "running", "pid": os.getpid(),
+                      "timestamp": "2026-11-10T10:00:00Z", "ports": []})
+        with open(os.path.join(container_dir, "stop.json"), "w") as filep:
+            json.dump({"signal": "SIGQUIT", "timeout": 5}, filep)
+        localrepo = Mock()
+        localrepo.get_container_id.return_value = "stop1"
+        localrepo.cd_container.return_value = container_dir
+        cli = self._cli(localrepo)
+        cmdp = CmdParser()
+        cmdp.parse(["udocker", "stop", "stop1"])
+        with patch('udocker.cli.Msg'), \
+                patch('udocker.cli.ExecutionMode') as mock_exec, \
+                patch('udocker.cli.supervisor.stop_monitor',
+                      return_value=0) as mock_stop:
+            mock_exec.return_value.get_mode.return_value = "P1"
+            self.assertEqual(cli.do_stop(cmdp), 0)
+        mock_stop.assert_called_once_with(container_dir, 5, sig="SIGQUIT")
+
 if __name__ == '__main__':
     main()

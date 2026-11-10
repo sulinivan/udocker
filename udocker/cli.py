@@ -6,6 +6,7 @@ import sys
 import string
 import json
 import random
+import hashlib
 import shutil
 import socket
 import time
@@ -595,6 +596,47 @@ class UdockerCLI(object):
                 json.dump(list(volumes), filep)
         except (IOError, OSError, ValueError, TypeError):
             pass
+
+    @staticmethod
+    def _stop_config(container_dir):
+        """Signal and timeout recorded for docker stop"""
+        if not isinstance(container_dir, str):
+            return {}
+        try:
+            with open(container_dir + "/stop.json", "r") as filep:
+                config = json.load(filep)
+        except (IOError, OSError, ValueError, TypeError):
+            return {}
+        return config if isinstance(config, dict) else {}
+
+    @staticmethod
+    def _save_stop_config(container_dir, signal, timeout):
+        """Record the stop signal and timeout of the last run"""
+        if not isinstance(container_dir, str):
+            return
+        config = {"signal": str(signal or ""), "timeout": timeout}
+        try:
+            with open(container_dir + "/stop.json", "w") as filep:
+                json.dump(config, filep)
+        except (IOError, OSError, ValueError, TypeError):
+            pass
+
+    @staticmethod
+    def _image_stop_signal(container_dir):
+        """StopSignal declared by the image metadata, empty when absent"""
+        if not isinstance(container_dir, (str, bytes)):
+            return ""
+        try:
+            with open(container_dir + "/container.json", "r") as filep:
+                data = json.load(filep)
+        except (IOError, OSError, ValueError, TypeError):
+            return ""
+        if not isinstance(data, dict):
+            return ""
+        meta = data.get("config") or data.get("container_config") or data
+        if not isinstance(meta, dict):
+            return ""
+        return str(meta.get("StopSignal") or meta.get("stopsignal") or "")
 
     @staticmethod
     def _save_labels(container_dir, labels):
@@ -1266,6 +1308,14 @@ class UdockerCLI(object):
                 "fl": ("--ulimit=",), "act": 'E',
                 "p2": "CMD_OPT", "p3": True
             },
+            "stopsignal": {
+                "fl": ("--stop-signal=",), "act": 'R',
+                "p2": "CMD_OPT", "p3": False
+            },
+            "stoptimeout": {
+                "fl": ("--stop-timeout=",), "act": 'R',
+                "p2": "CMD_OPT", "p3": False
+            },
             "nobanner": {
                 "fl": ("--nobanner",), "act": 'R',
                 "p2": "CMD_OPT", "p3": False
@@ -1342,6 +1392,8 @@ class UdockerCLI(object):
         --add-host=<host:ip>       :add a line to the container /etc/hosts
         --label=<key=value>        :set a container label (repeatable)
         --ulimit=<name=soft[:hard]>:set a resource limit (repeatable)
+        --stop-signal=<signal>     :signal sent by stop (default image value)
+        --stop-timeout=<seconds>   :seconds stop waits before killing
 
         Only available in Rn execution modes:
         --device=/dev/xxx          :pass device to container (R1 mode only)
@@ -1427,6 +1479,11 @@ class UdockerCLI(object):
         self._save_run_volumes(container_dir, opt.get("vol") or [])
         self._save_run_command(container_dir, opt)
         self._save_labels(container_dir, opt.get("labels") or [])
+        self._save_stop_config(
+            container_dir,
+            opt.get("stopsignal") or self._image_stop_signal(container_dir)
+            or "SIGTERM",
+            opt.get("stoptimeout"))
         if not self._expand_publish_all(exec_engine, container_id):
             return self.STATUS_ERROR
         portsmap = opt.get("portsmap") or []
@@ -1461,6 +1518,10 @@ class UdockerCLI(object):
             raise
         finally:
             ulimits_util.restore(saved_limits)
+        if not isinstance(exit_status, int) or getattr(
+                exec_engine, "exit_code", 0) == 127:
+            exit_status = 127 if getattr(
+                exec_engine, "exit_code", 0) == 127 else 1
         if forwarder:
             forwarder.stop()
         self._write_state(container_dir, "exited", exitcode=exit_status)
@@ -1559,7 +1620,7 @@ class UdockerCLI(object):
             Msg().err("Error: container not found:", arg)
         return container_id
 
-    def _stop_container(self, container_id, timeout):
+    def _stop_container(self, container_id, timeout, stop_signal="SIGTERM"):
         """Stop a container with runc/crun or with the monitor signals"""
         container_dir = self.localrepo.cd_container(container_id)
         if self._is_runc_mode(container_id):
@@ -1567,9 +1628,10 @@ class UdockerCLI(object):
             if not executable:
                 return self.STATUS_ERROR
             status = supervisor.stop(container_dir, executable, timeout,
-                                     Config.conf['topdir'])
+                                     Config.conf['topdir'], sig=stop_signal)
         else:
-            status = supervisor.stop_monitor(container_dir, timeout)
+            status = supervisor.stop_monitor(container_dir, timeout,
+                                             sig=stop_signal)
         if status != 0:
             Msg().err("Error: cannot stop container")
             return self.STATUS_ERROR
@@ -1652,11 +1714,14 @@ class UdockerCLI(object):
         stop [options] <container-id-or-name>
         -t, --time=<seconds>       :seconds to wait before killing (default 10)
         """
-        timeout = cmdp.get("-t=") or cmdp.get("--time=") or 10
+        timeout = cmdp.get("-t=") or cmdp.get("--time=")
         container_id = self._resolve_container(cmdp.get("P1"))
         if cmdp.missing_options() or not container_id:
             return self.STATUS_ERROR
         container_dir = self.localrepo.cd_container(container_id)
+        stop_config = self._stop_config(container_dir)
+        timeout = timeout or stop_config.get("timeout") or 10
+        stop_signal = stop_config.get("signal") or "SIGTERM"
         if not supervisor.is_running(container_dir):
             Msg().out("Info: container is not running", container_id,
                       l=Msg.INF)
@@ -1665,7 +1730,7 @@ class UdockerCLI(object):
             Msg().err("Error: container is paused;"
                       " unpause it before stopping:", container_id)
             return self.STATUS_ERROR
-        if self._stop_container(container_id, timeout) != 0:
+        if self._stop_container(container_id, timeout, stop_signal) != 0:
             return self.STATUS_ERROR
         Msg().out(container_id)
         return self.STATUS_OK
@@ -1676,11 +1741,14 @@ class UdockerCLI(object):
         restart [options] <container-id-or-name>
         -t, --time=<seconds>       :seconds to wait before killing (default 10)
         """
-        timeout = cmdp.get("-t=") or cmdp.get("--time=") or 10
+        timeout = cmdp.get("-t=") or cmdp.get("--time=")
         container_id = self._resolve_container(cmdp.get("P1"))
         if cmdp.missing_options() or not container_id:
             return self.STATUS_ERROR
         container_dir = self.localrepo.cd_container(container_id)
+        stop_config = self._stop_config(container_dir)
+        timeout = timeout or stop_config.get("timeout") or 10
+        stop_signal = stop_config.get("signal") or "SIGTERM"
         conf = supervisor.read_conf(container_dir)
         if not conf.get("argv"):
             Msg().err("Error: container was not started with -d")
@@ -1694,7 +1762,8 @@ class UdockerCLI(object):
             if not executable:
                 return self.STATUS_ERROR
         if supervisor.is_running(container_dir):
-            if self._stop_container(container_id, timeout) != 0:
+            if self._stop_container(container_id, timeout,
+                                    stop_signal) != 0:
                 return self.STATUS_ERROR
         if not supervisor.spawn(container_id, container_dir,
                                 conf["argv"], truncate=False):
@@ -1924,6 +1993,101 @@ class UdockerCLI(object):
         if cmdp.missing_options():
             return self.STATUS_ERROR
         return extras.system_prune(self.localrepo, "all", force)
+
+    NETWORKS = ("host", "none")
+
+    def _network_data(self, name):
+        """Docker shaped metadata of a rootless network"""
+        if name not in self.NETWORKS:
+            return None
+        driver = "host" if name == "host" else "null"
+        network_id = hashlib.sha256(name.encode()).hexdigest()[:12]
+        return {
+            "Name": name,
+            "Id": network_id,
+            "Created": "",
+            "Scope": "local",
+            "Driver": driver,
+            "EnableIPv6": False,
+            "IPAM": {"Driver": "default", "Options": {}, "Config": []},
+            "Internal": False,
+            "Attachable": False,
+            "Ingress": False,
+            "ConfigFrom": {"Network": ""},
+            "ConfigOnly": False,
+            "Containers": {},
+            "Options": {},
+            "Labels": {},
+        }
+
+    def do_network(self, cmdp):
+        """
+        network: manage docker networks (rootless: host and none only)
+        network ls [--format=json]     :list the available networks
+        network inspect <name> [<name>]:print network metadata
+        network create|rm|connect|disconnect :not available without root
+        """
+        raw = cmdp.get("P*") or []
+        subcmd = raw[0] if raw else None
+        args = []
+        output_format = ""
+        index = 1
+        while index < len(raw):
+            arg = raw[index]
+            if arg.startswith("--format="):
+                output_format = arg.split("=", 1)[1]
+            elif arg.startswith("-f="):
+                output_format = arg.split("=", 1)[1]
+            elif arg in ("--format", "-f") and index + 1 < len(raw):
+                index += 1
+                output_format = raw[index]
+            elif not arg.startswith("-"):
+                args.append(arg)
+            index += 1
+        if subcmd in ("ls", "list"):
+            networks = [self._network_data(name)
+                        for name in self.NETWORKS]
+            if output_format == "json":
+                for network in networks:
+                    Msg().out(json.dumps(network, sort_keys=True))
+            elif output_format and output_format != "table":
+                for network in networks:
+                    Msg().out(render_template(output_format, network))
+            else:
+                Msg().out("%-14s %-10s %-10s %s" %
+                          ("NETWORK ID", "NAME", "DRIVER", "SCOPE"))
+                for network in networks:
+                    Msg().out("%-14.14s %-10s %-10s %s" %
+                              (network["Id"], network["Name"],
+                               network["Driver"], network["Scope"]))
+            return self.STATUS_OK
+        if subcmd == "inspect":
+            if not args:
+                Msg().err("Error: network inspect requires a name")
+                return self.STATUS_ERROR
+            data = []
+            for name in args:
+                network = self._network_data(name)
+                if network is None:
+                    Msg().err("Error: no such network:", name)
+                    return self.STATUS_ERROR
+                data.append(network)
+            if output_format and output_format not in ("json", "table"):
+                for network in data:
+                    Msg().out(render_template(output_format, network))
+            else:
+                Msg().out(json.dumps(data, sort_keys=True, indent=4))
+            return self.STATUS_OK
+        if subcmd in ("create", "rm", "remove", "connect", "disconnect",
+                      "prune"):
+            Msg().err("Error: network", subcmd, "is not available without"
+                      " root/daemon; udocker uses the host network stack")
+            return self.STATUS_ERROR
+        if not subcmd:
+            Msg().err("Error: network requires a subcommand: ls, inspect")
+            return self.STATUS_ERROR
+        Msg().err("Error: unknown network subcommand:", subcmd)
+        return self.STATUS_ERROR
 
     def do_volume(self, cmdp):
         """
@@ -3561,6 +3725,8 @@ Docker-style command groups are accepted and translated:
   system df                     :Show disk usage of images and containers
   system prune [-f]             :Remove stopped containers and unused images
   image prune [-f]              :Remove images not used by containers
+  network ls                    :List available networks (host, none)
+  network inspect <name>        :Print network metadata as JSON
   volume create [<name>]        :Create a named volume
   volume ls                     :List named volumes
   volume inspect <name>         :Print volume metadata as JSON

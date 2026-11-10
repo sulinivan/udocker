@@ -65,6 +65,8 @@ class ExecutionEngineCommon(object):
     opt["addhost"] = []              # Extra /etc/hosts entries
     opt["labels"] = []               # Container labels
     opt["ulimit"] = []               # Resource limits
+    opt["stopsignal"] = ""           # Signal used by stop
+    opt["stoptimeout"] = None        # Seconds stop waits before KILL
 
     def __init__(self, localrepo, exec_mode):
         self.localrepo = localrepo            # LocalRepository instance
@@ -77,6 +79,7 @@ class ExecutionEngineCommon(object):
         self.exec_mode = exec_mode            # ExecutionMode instance
         self.mountp = None                    # MountPoint object
         self.executable = ""                  # Executable proot, runc, etc
+        self.exit_code = 0                    # Error code of the last run
 
     def _has_option(self, search_option, arg=None):
         """Check if executable has a given cli option"""
@@ -358,6 +361,7 @@ class ExecutionEngineCommon(object):
                                                   self.opt["cwd"])
         if exec_name:
             return self.container_root + '/' + exec_name
+        self.exit_code = 127
         Msg().err("Error: command not found or has no execute bit set: ",
                   self.opt["cmd"])
         return ""

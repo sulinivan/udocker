@@ -377,6 +377,7 @@ class ExecutionEngineCommonTestCase(TestCase):
         ex_eng.container_root = "/containers/123/ROOT"
         status = ex_eng._check_executable()
         self.assertEqual(status, "")
+        self.assertEqual(ex_eng.exit_code, 127)
         self.assertTrue(mock_fufindexe.called)
 
         Config.conf['cmd'] = "/bin/ls"
@@ -388,6 +389,7 @@ class ExecutionEngineCommonTestCase(TestCase):
         ex_eng.container_root = "/containers/123/ROOT"
         status = ex_eng._check_executable()
         self.assertEqual(status, "/containers/123/ROOT//bin/ls")
+        self.assertEqual(ex_eng.exit_code, 0)
 
         Config.conf['cmd'] = "/bin/ls"
         mock_fufindexe.return_value = "/bin/ls"

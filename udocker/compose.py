@@ -32,7 +32,8 @@ COMPOSE_FILES = ("compose.yaml", "compose.yml",
 SUPPORTED_KEYS = ("image", "build", "container_name", "command",
                   "entrypoint", "environment", "env_file", "ports",
                   "volumes", "working_dir", "user", "labels", "depends_on",
-                  "hostname", "extra_hosts", "ulimits")
+                  "hostname", "extra_hosts", "ulimits", "networks",
+                  "network_mode", "stop_signal", "stop_grace_period")
 
 ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}"
                          r"|\$([A-Za-z_][A-Za-z0-9_]*)")
@@ -618,6 +619,31 @@ def volume_name(project, source, volume_defs=None):
     return "%s_%s" % (project, source)
 
 
+def parse_duration(value):
+    """Compose duration ('10s', '1m30s', bare number) to seconds"""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    units = {"h": 3600, "m": 60, "s": 1}
+    total = 0
+    index = 0
+    while index < len(text):
+        start = index
+        while index < len(text) and text[index].isdigit():
+            index += 1
+        if start == index or index >= len(text) or text[index] not in units:
+            return None
+        total += int(text[start:index]) * units[text[index]]
+        index += 1
+    return total
+
+
 def parse_extra_hosts(value):
     """Normalize extra_hosts to a list of host:ip entries"""
     result = []
@@ -728,6 +754,8 @@ def normalize_service(project, service, config, compose_dir,
         "hostname": str(config.get("hostname") or ""),
         "extra_hosts": parse_extra_hosts(config.get("extra_hosts")),
         "ulimits": parse_ulimits(config.get("ulimits")),
+        "stop_signal": str(config.get("stop_signal") or ""),
+        "stop_timeout": parse_duration(config.get("stop_grace_period")),
         "depends_on": parse_depends_on(config.get("depends_on")),
     }
 
@@ -771,6 +799,10 @@ def run_arguments(plan):
         args.append("--label=" + item)
     for item in plan.get("ulimits") or []:
         args.append("--ulimit=" + item)
+    if plan.get("stop_signal"):
+        args.append("--stop-signal=" + plan["stop_signal"])
+    if plan.get("stop_timeout") is not None:
+        args.append("--stop-timeout=" + str(plan["stop_timeout"]))
     args.append(plan["container_name"])
     args.extend(plan["command"])
     return args
@@ -1365,7 +1397,8 @@ def do_compose(cli, cmdp):
     build sections via udocker build, named volumes ("name:/path" becomes
     <project>_<name> unless the top-level volumes section sets name: or
     external: true), hostname/extra_hosts/labels, env_file, .env
-    substitution, ulimits and extra_hosts, all passed to udocker run.
+    substitution, ulimits, stop_signal/stop_grace_period; service networks
+    and network_mode are accepted (everything shares the host network).
     """
     consume = getattr(cmdp, "consume_all", None)
     if consume is not None:
