@@ -128,7 +128,7 @@ class SingularityEngineTestCase(TestCase):
         sing.opt['netcoop'] = False
         sing.opt['portsmap'] = True
         sing._run_invalid_options()
-        self.assertTrue(mock_msg.called)
+        self.assertFalse(mock_msg.called)
 
     @patch.object(SingularityEngine, '_has_option')
     @patch('udocker.engine.singularity.NixAuthentication')
@@ -188,7 +188,7 @@ class SingularityEngineTestCase(TestCase):
     @patch.object(SingularityEngine, '_make_container_directories')
     @patch.object(SingularityEngine, '_run_invalid_options')
     @patch.object(SingularityEngine, '_run_init')
-    @patch('udocker.engine.singularity.subprocess.call')
+    @patch.object(SingularityEngine, '_exec_command')
     @patch('udocker.engine.singularity.Unique.uuid')
     @patch('udocker.engine.singularity.FileBind')
     @patch('udocker.engine.singularity.os.path.isdir')

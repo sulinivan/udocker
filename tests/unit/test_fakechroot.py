@@ -241,7 +241,7 @@ class FakechrootEngineTestCase(TestCase):
         ufake.opt['netcoop'] = False
         ufake.opt['portsmap'] = True
         ufake._run_invalid_options()
-        self.assertTrue(mock_msg.called)
+        self.assertFalse(mock_msg.called)
 
     @patch('udocker.engine.fakechroot.FileUtil.get1stline')
     @patch('udocker.engine.fakechroot.FileUtil.cont2host')
@@ -290,7 +290,7 @@ class FakechrootEngineTestCase(TestCase):
     @patch.object(FakechrootEngine, '_run_invalid_options')
     @patch.object(FakechrootEngine, '_run_init')
     @patch.object(FakechrootEngine, '_uid_check')
-    @patch('udocker.engine.fakechroot.subprocess.call')
+    @patch.object(FakechrootEngine, '_exec_command')
     @patch('udocker.engine.fakechroot.ElfPatcher')
     @patch('udocker.engine.fakechroot.Msg')
     def test_10_run(self, mock_msg, mock_elfp, mock_call, mock_uidc,

@@ -532,7 +532,7 @@ class RuncEngineTestCase(TestCase):
         rcex.opt['netcoop'] = False
         rcex.opt['portsmap'] = True
         rcex._run_invalid_options()
-        self.assertTrue(mock_msg.called)
+        self.assertFalse(mock_msg.called)
 
     @patch.object(RuncEngine, '_create_mountpoint')
     @patch('udocker.engine.runc.stat')

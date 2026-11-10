@@ -181,7 +181,7 @@ class PRootEngineTestCase(TestCase):
     @patch.object(PRootEngine, '_run_env_set')
     @patch.object(PRootEngine, 'select_proot')
     @patch('udocker.engine.proot.os.getenv')
-    @patch('udocker.engine.proot.subprocess.call')
+    @patch.object(PRootEngine, '_exec_command')
     @patch('udocker.engine.proot.ExecutionEngineCommon._run_init')
     def test_07_run(self, mock_run_init, mock_call, mock_getenv, mock_sel_proot,
                     mock_run_env_set,

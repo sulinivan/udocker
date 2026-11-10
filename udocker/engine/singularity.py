@@ -3,7 +3,6 @@
 
 import sys
 import os
-import subprocess
 
 from udocker.engine.base import ExecutionEngineCommon
 from udocker.msg import Msg
@@ -97,13 +96,11 @@ class SingularityEngine(ExecutionEngineCommon):
         FileUtil(self.container_root + "/root").mkdir()
 
     def _run_invalid_options(self):
-        """check -p --publish -P --publish-all --net-coop"""
-        if self.opt["portsmap"]:
-            Msg().out("Warning: this execution mode does not support "
-                      "-p --publish", l=Msg.WAR)
-        if self.opt["netcoop"]:
-            Msg().out("Warning: this execution mode does not support "
-                      "-P --netcoop --publish-all", l=Msg.WAR)
+        """Port publishing is handled by PRoot (P modes) or by the
+        userspace TCP forwarder started by the CLI (F/R/S modes);
+        there is nothing to reject here.
+        """
+        return
 
     def _run_as_root(self):
         """Set configure running as normal user or as root via --fakeroot
@@ -191,8 +188,6 @@ class SingularityEngine(ExecutionEngineCommon):
         self._run_env_cleanup_dict()
 
         # execute
+        os.environ.update(self._singularity_env_get())
         self._run_banner(self.opt["cmd"][0], '/')
-        status = subprocess.call(cmd_l, shell=False, close_fds=False,
-                                 env=os.environ.update(self._singularity_env_get()))
-
-        return status
+        return self._exec_command(cmd_l)

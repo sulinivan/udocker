@@ -6,7 +6,6 @@ import os
 import subprocess
 import platform
 import stat
-import select
 import json
 
 from udocker.msg import Msg
@@ -150,7 +149,8 @@ class RuncEngine(ExecutionEngineCommon):
         if self.opt["cwd"]:
             json_obj["process"]["cwd"] = self.opt["cwd"]
 
-        json_obj["process"]["terminal"] = sys.stdout.isatty()
+        json_obj["process"]["terminal"] = bool(self.opt.get("tty")) or \
+            sys.stdout.isatty()
         if self.engine_type == "crun":
             json_obj["process"]["terminal"] = False
 
@@ -330,13 +330,11 @@ class RuncEngine(ExecutionEngineCommon):
                     self._filebind.add_file(host_dir, cont_dir)
 
     def _run_invalid_options(self):
-        """check -p --publish -P --publish-all --net-coop"""
-        if self.opt["portsmap"]:
-            Msg().out("Warning: this execution mode does not support "
-                      "-p --publish", l=Msg.WAR)
-        if self.opt["netcoop"]:
-            Msg().out("Warning: this execution mode does not support "
-                      "-P --netcoop --publish-all", l=Msg.WAR)
+        """Port publishing is handled by PRoot (P modes) or by the
+        userspace TCP forwarder started by the CLI (F/R/S modes);
+        there is nothing to reject here.
+        """
+        return
 
     def _proot_overlay(self, proot_mode="P2"):
         """Execute proot within runc"""
@@ -358,6 +356,9 @@ class RuncEngine(ExecutionEngineCommon):
 
         if env_noseccomp:
             self._container_specjson["process"]["env"].append(env_noseccomp)
+
+        self._container_specjson["process"]["env"].append(
+            "PROOT_TMP_DIR=/tmp")
 
         host_executable = preng.executable
         cont_executable = "/.udocker/bin/" + os.path.basename(host_executable)
@@ -465,36 +466,12 @@ class RuncEngine(ExecutionEngineCommon):
         return status
 
     def run_nopty(self, cmd_l):
-        """runc without a terminal"""
-        (pmaster, pslave) = os.openpty()
-        status = subprocess.Popen(cmd_l, shell=False, close_fds=False,
-                                  stdout=pslave, stderr=pslave,
-                                  env=runtime_env(Config.conf['topdir']))
-        os.close(pslave)
-        while True:
-            status.poll()
-            if status.returncode is not None:
-                break
-            readable, dummy, exception = \
-                select.select([pmaster, ], [], [pmaster, ], 5)
-            if exception:
-                break
-            if readable:
-                try:
-                    if sys.version_info[0] >= 3:
-                        sys.stdout.write(os.read(pmaster, 1).decode())
-                    else:
-                        sys.stdout.write(os.read(pmaster, 1))
-                    sys.stdout.flush()
-                except OSError:
-                    break
-        try:
-            status.terminate()
-        except OSError:
-            pass
-        try:
-            status.wait()
-        except OSError:
-            pass
+        """runc without a host terminal: relay through a pseudo terminal
+
+        With -t the container gets its own console (process.terminal) and
+        stdin is relayed back to it through the pseudo terminal.
+        """
+        status = self._exec_command_pty(
+            cmd_l, env=runtime_env(Config.conf['topdir']))
         self._filebind.finish()
-        return status.returncode
+        return status

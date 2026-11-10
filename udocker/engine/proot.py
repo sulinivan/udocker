@@ -3,7 +3,6 @@
 
 import sys
 import os
-import subprocess
 
 from udocker.msg import Msg
 from udocker.config import Config
@@ -197,8 +196,12 @@ class PRootEngine(ExecutionEngineCommon):
         # cleanup the environment
         self._run_env_cleanup_dict()
 
+        # proot needs a tmp dir that it can canonicalize; the host TMPDIR
+        # is dropped by the environment cleanup and may not be usable
+        if not os.environ.get("PROOT_TMP_DIR"):
+            os.environ["PROOT_TMP_DIR"] = Config.conf['tmpdir']
+        os.environ.update(self.opt["env"].dict())
+
         # execute
         self._run_banner(self.opt["cmd"][0])
-        status = subprocess.call(cmd_l, shell=False, close_fds=False,
-                                 env=os.environ.update(self.opt["env"].dict()))
-        return status
+        return self._exec_command(cmd_l)

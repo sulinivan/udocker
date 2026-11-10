@@ -91,6 +91,10 @@ class UMain(object):
             "stop": self.cli.do_stop, "restart": self.cli.do_restart,
             "kill": self.cli.do_kill, "exec": self.cli.do_exec,
             "logs": self.cli.do_logs, "wait": self.cli.do_wait,
+            "top": self.cli.do_top, "stats": self.cli.do_stats,
+            "diff": self.cli.do_diff, "port": self.cli.do_port,
+            "system": self.cli.do_system, "image": self.cli.do_image,
+            "prune": self.cli.do_prune,
         }
 
         if ((len(self.argv) == 1) or

@@ -5,6 +5,12 @@ import os
 import sys
 import re
 import json
+import fcntl
+import select
+import struct
+import termios
+import tty
+import subprocess
 
 from udocker.genstr import is_genstr
 from udocker.msg import Msg
@@ -52,6 +58,10 @@ class ExecutionEngineCommon(object):
     opt["portsexp"] = []             # Ports exposed by container
     opt["devices"] = []              # Devices passed to container
     opt["nobanner"] = False          # Printing of startup banner
+    opt["dns"] = []                  # DNS servers for the container
+    opt["dnssearch"] = []            # DNS search domains
+    opt["tty"] = False               # Allocate a pseudo terminal
+    opt["interactive"] = False       # Keep stdin attached (non tty stdin)
 
     def __init__(self, localrepo, exec_mode):
         self.localrepo = localrepo            # LocalRepository instance
@@ -211,7 +221,32 @@ class ExecutionEngineCommon(object):
             if not found:
                 Msg().err("Warning: --novol %s not in volumes list"
                           % novolume, l=Msg.WAR)
+        if not self._setup_resolv_conf():
+            return False
         return self._check_volumes()
+
+    def _setup_resolv_conf(self):
+        """Provide the container /etc/resolv.conf from --dns / --dns-search
+
+        The host file is bind mounted by default via sysdirs; when the user
+        supplies DNS settings a private resolv.conf is generated and takes
+        the place of the host one.
+        """
+        if not (self.opt["dns"] or self.opt["dnssearch"]):
+            return True
+        lines = ["nameserver %s" % dns for dns in self.opt["dns"]]
+        for search in self.opt["dnssearch"]:
+            lines.append("search %s" % search)
+        tmp_file = FileUtil("resolv.conf").mktmp()
+        if not FileUtil(tmp_file).putdata("\n".join(lines) + "\n", "w"):
+            Msg().err("Error: cannot create the container resolv.conf")
+            return False
+        cont_path = "/etc/resolv.conf"
+        for vol in list(self.opt["vol"]):
+            if Uvolume(vol).split() == ("/etc/resolv.conf", cont_path):
+                self.opt["vol"].remove(vol)
+        self.opt["vol"].append(tmp_file + ":" + cont_path)
+        return True
 
     def _check_paths(self):
         """Make sure we have a reasonable default PATH and CWD"""
@@ -340,7 +375,7 @@ class ExecutionEngineCommon(object):
         if not is_genstr(user):
             return user_id
 
-        if re.match("^[a-zA-Z_][a-zA-Z0-9_-]*$", user):
+        if re.match("^[a-zA-Z_][a-zA-Z0-9_.-]*$", user):
             user_id["user"] = user
             return user_id
 
@@ -696,3 +731,162 @@ class ExecutionEngineCommon(object):
             Msg().err("Warning: qemu required but not available", l=Msg.WAR)
             return ""
         return qemu_path if return_path else qemu_filename
+
+    @staticmethod
+    def _pty_preexec(slave):
+        """Return a preexec callback that makes slave the controlling tty"""
+        def _preexec():
+            os.setsid()
+            try:
+                fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+            except (IOError, OSError):
+                pass
+        return _preexec
+
+    @staticmethod
+    def _pty_winsize(master):
+        """Copy the terminal size of stdout to the pseudo terminal"""
+        try:
+            winsize = fcntl.ioctl(sys.stdout.fileno(),
+                                  termios.TIOCGWINSZ,
+                                  struct.pack("HHHH", 0, 0, 0, 0))
+            fcntl.ioctl(master, termios.TIOCSWINSZ, winsize)
+        except (IOError, OSError, struct.error):
+            pass
+
+    def _stdin_attached(self):
+        """Hand stdin to the container when -i or stdin is a terminal"""
+        return bool(self.opt.get("interactive")) or sys.stdin.isatty()
+
+    def _stdin_handle(self):
+        """Open /dev/null when stdin must not reach the container"""
+        if self._stdin_attached():
+            return None
+        try:
+            return open(os.devnull, "r")
+        except (IOError, OSError):
+            return None
+
+    def _exec_command(self, cmd_l, env=None, cwd=None):
+        """Run the container command honouring -i and -t"""
+        if self.opt.get("tty"):
+            return self._exec_command_pty(cmd_l, env, cwd)
+        return self._exec_command_nopty(cmd_l, env, cwd)
+
+    def _exec_command_nopty(self, cmd_l, env=None, cwd=None):
+        """Run the container command with inherited or closed stdin"""
+        stdin = self._stdin_handle()
+        try:
+            return subprocess.call(cmd_l, shell=False, close_fds=False,
+                                   env=env, cwd=cwd, stdin=stdin)
+        except (OSError, ValueError) as error:
+            Msg().err("Error: executing container:", str(error))
+            return 1
+        finally:
+            if stdin is not None:
+                stdin.close()
+
+    def _exec_command_pty(self, cmd_l, env=None, cwd=None):
+        """Run the container command attached to a pseudo terminal
+
+        Used for -t when the caller (cron, CI, a pipe) has no terminal
+        of its own. stdin is relayed only with -i or when the host stdin
+        is already a terminal.
+        """
+        try:
+            (master, slave) = os.openpty()
+        except (OSError, AttributeError) as error:
+            Msg().err("Error: cannot allocate a pseudo terminal:",
+                      str(error))
+            return self._exec_command_nopty(cmd_l, env, cwd)
+        relay_stdin = self._stdin_attached()
+        stdin_fd = sys.stdin.fileno() if relay_stdin else None
+        saved_attrs = None
+        if relay_stdin and sys.stdin.isatty():
+            try:
+                saved_attrs = termios.tcgetattr(stdin_fd)
+                tty.setraw(stdin_fd)
+            except (termios.error, IOError, OSError):
+                saved_attrs = None
+        self._pty_winsize(master)
+        preexec = self._pty_preexec(slave) if self.opt.get("tty") else None
+        try:
+            proc = subprocess.Popen(
+                cmd_l, stdin=slave, stdout=slave, stderr=slave,
+                shell=False, close_fds=False, env=env, cwd=cwd,
+                preexec_fn=preexec)
+        except (OSError, ValueError) as error:
+            Msg().err("Error: executing container:", str(error))
+            os.close(slave)
+            os.close(master)
+            if saved_attrs is not None:
+                termios.tcsetattr(stdin_fd, termios.TCSADRAIN, saved_attrs)
+            return 1
+        os.close(slave)
+        try:
+            status = self._relay_pty(master, proc, stdin_fd)
+        finally:
+            if saved_attrs is not None:
+                try:
+                    termios.tcsetattr(stdin_fd, termios.TCSADRAIN,
+                                      saved_attrs)
+                except (termios.error, IOError, OSError):
+                    pass
+            try:
+                os.close(master)
+            except OSError:
+                pass
+        return status
+
+    @staticmethod
+    def _relay_pty(master, proc, stdin_fd=None):
+        """Relay data between a pseudo terminal and the host stdio"""
+        out_fd = sys.stdout.fileno()
+        while True:
+            read_fds = [master]
+            if stdin_fd is not None:
+                read_fds.append(stdin_fd)
+            try:
+                readable = select.select(read_fds, [], [], 0.2)[0]
+            except (select.error, OSError, ValueError):
+                break
+            for fd in readable:
+                try:
+                    data = os.read(fd, 4096)
+                except OSError:
+                    data = b""
+                if not data:
+                    if fd == stdin_fd:
+                        stdin_fd = None
+                    continue
+                try:
+                    if fd == master:
+                        os.write(out_fd, data)
+                    else:
+                        os.write(master, data)
+                except (OSError, IOError):
+                    return proc.wait()
+            if proc.poll() is not None:
+                break
+        while True:
+            try:
+                readable = select.select([master], [], [], 0.2)[0]
+            except (select.error, OSError, ValueError):
+                break
+            if not readable:
+                break
+            try:
+                data = os.read(master, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            try:
+                os.write(out_fd, data)
+            except (OSError, IOError):
+                break
+        try:
+            return proc.wait()
+        except OSError:
+            return 1
+

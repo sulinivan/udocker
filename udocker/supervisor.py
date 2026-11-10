@@ -70,11 +70,49 @@ def is_running(container_dir):
     state = read_state(container_dir)
     if state.get("status") != "running":
         return False
+    return _pid_alive(state.get("pid", 0))
+
+
+def write_state(container_dir, status, exitcode=None, ports=None):
+    """Record the execution state of a container for ps
+    Published ports are preserved across updates when not given.
+    """
+    if not isinstance(container_dir, str) or not container_dir:
+        return
+    state = read_state(container_dir)
+    state["status"] = status
+    state["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                       time.gmtime())
+    if status == "running":
+        state["pid"] = os.getpid()
+    else:
+        state.pop("pid", None)
+    if exitcode is not None:
+        state["exitcode"] = exitcode
+    elif status != "exited":
+        state.pop("exitcode", None)
+    if ports is not None:
+        state["ports"] = list(ports)
     try:
-        os.kill(int(state.get("pid", 0)), 0)
-    except (OSError, ValueError, TypeError):
-        return False
-    return True
+        with open(os.path.join(container_dir, STATE_NAME), "w") as filep:
+            json.dump(state, filep)
+    except (IOError, OSError, ValueError, TypeError):
+        pass
+
+
+def reconcile(container_dir):
+    """Fix the state of a container whose monitor died without writing
+
+    Rootless engines without a control channel (P/F/S) can be killed
+    from outside; ps and wait must still report them as exited.
+    """
+    state = read_state(container_dir)
+    if state.get("status") != "running":
+        return state
+    if _pid_alive(state.get("pid", 0)):
+        return state
+    write_state(container_dir, "exited", 137)
+    return read_state(container_dir)
 
 
 def _popen_kwargs():
@@ -90,12 +128,19 @@ def _devnull():
 
 
 def _pid_alive(pid):
-    """Is a process alive"""
+    """Is a process alive and not a zombie"""
     try:
-        os.kill(int(pid), 0)
+        pid = int(pid)
+        os.kill(pid, 0)
     except (OSError, ValueError, TypeError):
         return False
-    return True
+    try:
+        with open("/proc/%d/stat" % pid, "r") as filep:
+            data = filep.read()
+        state = data.rsplit(")", 1)[1].split()[0]
+    except (IOError, OSError, IndexError):
+        return True
+    return state != "Z"
 
 
 def wait_running(container_dir, proc=None, timeout=15):
@@ -202,6 +247,107 @@ def _signal_monitor(container_dir, sig):
     except (OSError, ValueError, TypeError, AttributeError):
         return 1
     return 0
+
+
+def _signal_number(sig):
+    """Translate a signal name or number into a signal number"""
+    if re.match(r"^\d+$", str(sig)):
+        return int(sig)
+    name = str(sig).upper()
+    if name.startswith("SIG"):
+        name = name[3:]
+    return getattr(signal, "SIG" + name, None)
+
+
+def signal_monitor(container_dir, sig="KILL"):
+    """Signal the monitor process group of a non runc container
+
+    The monitor is spawned in its own session, so the container
+    processes share its process group and all of them are signalled.
+    """
+    state = read_state(container_dir)
+    try:
+        pid = int(state.get("pid", 0))
+    except (TypeError, ValueError):
+        return 1
+    number = _signal_number(sig)
+    if number is None:
+        Msg().err("Error: invalid signal:", sig)
+        return 1
+    try:
+        os.killpg(os.getpgid(pid), number)
+    except OSError:
+        try:
+            os.kill(pid, number)
+        except OSError:
+            return 1
+    return 0
+
+
+def _group_alive(pgid):
+    """Is any process of the container process group still alive
+
+    Zombies are ignored: a killed monitor stays a zombie until its
+    parent reaps it and must not keep stop waiting.
+    """
+    if not pgid:
+        return False
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % entry, "r") as filep:
+                data = filep.read()
+            fields = data.rsplit(")", 1)[1].split()
+            state = fields[0]
+            pgrp = int(fields[2])
+        except (IOError, OSError, IndexError, ValueError):
+            continue
+        if pgrp == int(pgid) and state != "Z":
+            return True
+    return False
+
+
+def _monitor_group(container_dir):
+    """Process group of the container monitor, None when unknown"""
+    state = read_state(container_dir)
+    try:
+        return os.getpgid(int(state.get("pid", 0)))
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def wait_stopped(container_dir, timeout=10):
+    """Wait until the monitor and its process group are gone"""
+    pgid = _monitor_group(container_dir)
+    deadline = time.time() + float(timeout)
+    while time.time() < deadline:
+        if not is_running(container_dir) and not _group_alive(pgid):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def stop_monitor(container_dir, timeout=10, sig="TERM"):
+    """Stop a container whose engine has no runc control channel"""
+    if not is_running(container_dir):
+        reconcile(container_dir)
+        return 0
+    if signal_monitor(container_dir, sig) != 0:
+        return 1
+    if wait_stopped(container_dir, timeout):
+        write_state(container_dir, "exited", 128 + 15)
+        return 0
+    signal_monitor(container_dir, "KILL")
+    if wait_stopped(container_dir, 3):
+        write_state(container_dir, "exited", 137)
+        return 0
+    Msg().err("Error: container did not stop")
+    return 1
 
 
 def stop(container_dir, executable, timeout=10, topdir="", sig="TERM"):
@@ -324,6 +470,7 @@ def wait(container_dir, timeout=None):
         if deadline is not None and time.time() > deadline:
             return None
         time.sleep(0.1)
+    reconcile(container_dir)
     state = read_state(container_dir)
     return state.get("exitcode")
 

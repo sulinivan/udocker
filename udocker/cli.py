@@ -6,6 +6,7 @@ import sys
 import string
 import json
 import shutil
+import socket
 import time
 from getpass import getpass
 
@@ -28,6 +29,7 @@ from udocker.utils.mountpoint import MountPoint
 from udocker.utils.portforward import PortForwarder
 from udocker.utils.containerpath import container_realpath
 from udocker import supervisor
+from udocker import extras
 
 # if Python 3
 if sys.version_info[0] >= 3:
@@ -240,22 +242,9 @@ class UdockerCLI(object):
         return True
 
     @staticmethod
-    def _write_state(container_dir, status, exitcode=None):
+    def _write_state(container_dir, status, exitcode=None, ports=None):
         """Record the execution state of a container for ps"""
-        if not isinstance(container_dir, (str, bytes)):
-            return
-        state = {"status": status,
-                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                            time.gmtime())}
-        if status == "running":
-            state["pid"] = os.getpid()
-        if exitcode is not None:
-            state["exitcode"] = exitcode
-        try:
-            with open(container_dir + "/state.json", "w") as filep:
-                json.dump(state, filep)
-        except (IOError, OSError, ValueError, TypeError):
-            pass
+        supervisor.write_state(container_dir, status, exitcode, ports=ports)
 
     @staticmethod
     def _container_status(container_dir):
@@ -279,6 +268,96 @@ class UdockerCLI(object):
         if status == "interrupted":
             return "Interrupted"
         return "Created"
+
+    @staticmethod
+    def _free_tcp_port():
+        """Pick a free localhost TCP port for -P"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
+        except (OSError, ValueError):
+            return 0
+        finally:
+            sock.close()
+
+    def _expand_publish_all(self, exec_engine, container_id):
+        """Map the image ExposedPorts to free host ports for -P
+        The mappings are explicit afterwards: PRoot publishes them with
+        -p in P modes and the userspace forwarder does it in F/R/S modes.
+        """
+        if not isinstance(getattr(exec_engine, "opt", None), dict):
+            return True
+        if not exec_engine.opt.get("netcoop"):
+            return True
+        container_structure = ContainerStructure(self.localrepo,
+                                                 container_id)
+        (dummy, container_json) = container_structure.get_container_attr()
+        exposed = []
+        if container_json:
+            exposed = container_structure.get_container_meta(
+                "ExposedPorts", [], container_json)
+        for port in exposed or []:
+            # metadata dicts are flattened to "key:value" strings by
+            # ContainerStructure, so "8080/tcp:{}" -> port "8080/tcp"
+            port_str = str(port).split(":", 1)[0]
+            port_spec = port_str.split("/")[0]
+            proto = "tcp"
+            if "/" in port_str:
+                proto = port_str.split("/", 1)[1]
+            if proto != "tcp":
+                Msg().out("Warning: -P publishes TCP ports only, skipping:",
+                          port_str, l=Msg.WAR)
+                continue
+            host_port = self._free_tcp_port()
+            if not host_port:
+                Msg().err("Error: cannot find a free host port for:", port)
+                return False
+            mapping = "%d:%s" % (host_port, port_spec)
+            if mapping not in exec_engine.opt["portsmap"]:
+                exec_engine.opt["portsmap"].append(mapping)
+        # the mappings are explicit now, avoid the engine -P warnings
+        exec_engine.opt["netcoop"] = False
+        return True
+
+    def _expand_volumes_from(self, exec_engine):
+        """Append the volumes of containers named with --volumes-from"""
+        if not isinstance(getattr(exec_engine, "opt", None), dict):
+            return True
+        refs = exec_engine.opt.get("volfrom")
+        if not isinstance(refs, (list, tuple)):
+            return True
+        for ref in refs:
+            ref_id = self.localrepo.get_container_id(ref)
+            if not ref_id:
+                Msg().err("Error: --volumes-from container not found:", ref)
+                return False
+            ref_dir = self.localrepo.cd_container(ref_id) or ""
+            volumes = []
+            try:
+                with open(ref_dir + "/volumes.json", "r") as filep:
+                    volumes = json.load(filep)
+            except (IOError, OSError, ValueError, TypeError):
+                volumes = []
+            if not volumes:
+                Msg().out("Warning: container has no recorded volumes:",
+                          ref, l=Msg.WAR)
+                continue
+            for vol in volumes:
+                if vol not in exec_engine.opt["vol"]:
+                    exec_engine.opt["vol"].append(vol)
+        return True
+
+    @staticmethod
+    def _save_run_volumes(container_dir, volumes):
+        """Remember the volume bindings for later --volumes-from"""
+        if not isinstance(container_dir, str):
+            return
+        try:
+            with open(container_dir + "/volumes.json", "w") as filep:
+                json.dump(list(volumes), filep)
+        except (IOError, OSError, ValueError, TypeError):
+            pass
 
     @staticmethod
     def _start_port_forwarder(exec_engine, exec_mode):
@@ -779,7 +858,8 @@ class UdockerCLI(object):
 
     def _get_run_options(self, cmdp, exec_engine=None):
         """Read command line options into variables"""
-        cmdp.declare_options("-v= -e= -w= -u= -p= -i -t -a -P")
+        cmdp.declare_options("-v= -e= -w= -u= -p= -i -t -a -P "
+                             "--dns= --dns-search= --volumes-from=")
         cmd_options = {
             "netcoop": {
                 "fl": ("-P", "--publish-all", "--netcoop",), "act": "R",
@@ -854,15 +934,23 @@ class UdockerCLI(object):
                 "p2": "CMD_OPT", "p3": False
             },
             "volfrom": {
-                "fl": ("--volumes-from=",), "act": "R",
-                "p2": "CMD_OPT", "p3": False
+                "fl": ("--volumes-from=",), "act": "E",
+                "p2": "CMD_OPT", "p3": True
             },
             "dns": {
-                "fl": ("--dns=",), "act": "R",
-                "p2": "CMD_OPT", "p3": False
+                "fl": ("--dns=",), "act": "E",
+                "p2": "CMD_OPT", "p3": True
             },
             "dnssearch": {
-                "fl": ("--dns-search=",), "act": "R",
+                "fl": ("--dns-search=",), "act": "E",
+                "p2": "CMD_OPT", "p3": True
+            },
+            "tty": {
+                "fl": ("-t", "--tty"), "act": "R",
+                "p2": "CMD_OPT", "p3": False
+            },
+            "interactive": {
+                "fl": ("-i", "--interactive"), "act": "R",
                 "p2": "CMD_OPT", "p3": False
             },
             "kernel": {
@@ -930,14 +1018,19 @@ class UdockerCLI(object):
         --platform=os/arch         :pull image for OS and architecture
         --pull=<when>              :when to pull (missing|never|always|reuse)
         --httpproxy=<proxy>        :use http proxy, see udocker pull --help
-        -d, --detach               :run in background (Rn modes, runc/crun)
+        -d, --detach               :run in background (all execution modes)
+        -i, --interactive          :keep stdin attached when it is not a tty
+        -t, --tty                  :allocate a pseudo terminal
+        --dns=<addr>               :set the container DNS server (repeatable)
+        --dns-search=<domain>      :set the container DNS search domain
+        --volumes-from=<container> :copy volume bindings of a container
 
         Only available in Rn execution modes:
         --device=/dev/xxx          :pass device to container (R1 mode only)
 
         Port publishing:
         --publish=<hport:cport>    :map container TCP/IP <cport> into <hport>
-        --publish-all              :bind and connect to random ports (Pn only)
+        --publish-all              :map the exposed ports to random host ports
         In Pn modes publishing is done by PRoot, in Fn/Rn/Sn modes -p is
         implemented with a userspace TCP forwarder (no privileges needed).
 
@@ -1000,17 +1093,31 @@ class UdockerCLI(object):
             return self.STATUS_ERROR
 
         self._get_run_options(cmdp, exec_engine)
+        opt = exec_engine.opt
+        if not isinstance(opt, dict):
+            opt = {}
         container_dir = ""
         if not Config.conf['location']:
             container_dir = self.localrepo.cd_container(container_id)
+        if not self._expand_volumes_from(exec_engine):
+            return self.STATUS_ERROR
+        self._save_run_volumes(container_dir, opt.get("vol") or [])
+        if not self._expand_publish_all(exec_engine, container_id):
+            return self.STATUS_ERROR
+        portsmap = opt.get("portsmap") or []
         if detach:
+            if opt.get("interactive"):
+                Msg().out("Warning: -i is ignored with -d: there is no "
+                          "terminal to attach to", l=Msg.WAR)
             return self._run_detached(container_id, container_dir,
-                                      container_or_image, exec_mode, delete)
+                                      container_or_image, exec_mode, delete,
+                                      ports=portsmap,
+                                      netcoop=bool(opt.get("netcoop")))
         forwarder = self._start_port_forwarder(exec_engine, exec_mode)
         if forwarder is False:
             Msg().err("Error: cannot publish container ports")
             return self.STATUS_ERROR
-        self._write_state(container_dir, "running")
+        self._write_state(container_dir, "running", ports=portsmap)
         try:
             exit_status = exec_engine.run(container_id)
         except BaseException:
@@ -1026,7 +1133,8 @@ class UdockerCLI(object):
 
         return exit_status
 
-    def _detach_argv(self, container_id, container_or_image):
+    def _detach_argv(self, container_id, container_or_image,
+                     ports=None, netcoop=False):
         """Build the monitor command line from this invocation"""
         cleaned = []
         skip_next = False
@@ -1051,6 +1159,14 @@ class UdockerCLI(object):
             return []
         if "--nobanner" not in rest:
             rest.insert(run_index + 1, "--nobanner")
+        # -P was expanded by the parent: hand the explicit mappings to the
+        # monitor so it does not pick a different set of random ports
+        if not netcoop:
+            rest = [arg for arg in rest
+                    if arg not in ("-P", "--publish-all", "--netcoop")]
+            for offset, mapping in enumerate(ports or []):
+                rest.insert(run_index + 1 + offset,
+                            "--publish=%s" % mapping)
         if container_or_image:
             for position in range(run_index + 1, len(rest)):
                 if rest[position] == container_or_image:
@@ -1059,19 +1175,20 @@ class UdockerCLI(object):
         return rest
 
     def _run_detached(self, container_id, container_dir,
-                      container_or_image, exec_mode, delete):
-        """Start a container in the background under the runc supervisor"""
-        mode = exec_mode.get_mode()
-        if not (isinstance(mode, str) and mode.startswith("R")):
-            Msg().err("Error: -d requires an Rn execution mode (runc/crun)")
-            return self.STATUS_ERROR
+                      container_or_image, exec_mode, delete,
+                      ports=None, netcoop=False):
+        """Start a container in the background under the supervisor"""
         if delete:
             Msg().err("Error: --rm cannot be combined with -d")
             return self.STATUS_ERROR
         if self.localrepo.iswriteable_container(container_id) != 1:
             Msg().err("Error: container is not writable")
             return self.STATUS_ERROR
-        argv = self._detach_argv(container_id, container_or_image)
+        if supervisor.is_running(container_dir):
+            Msg().err("Error: container is already running")
+            return self.STATUS_ERROR
+        argv = self._detach_argv(container_id, container_or_image,
+                                 ports, netcoop)
         if not argv:
             Msg().err("Error: cannot build the supervisor command line")
             return self.STATUS_ERROR
@@ -1094,6 +1211,11 @@ class UdockerCLI(object):
         engine.select_runc()
         return (engine, engine.executable)
 
+    def _is_runc_mode(self, container_id):
+        """Is the container configured for an Rn execution mode"""
+        mode = ExecutionMode(self.localrepo, container_id).get_mode()
+        return isinstance(mode, str) and mode.startswith("R")
+
     def _resolve_container(self, arg):
         """Resolve a container id or name, print an error if missing"""
         if not arg:
@@ -1105,13 +1227,17 @@ class UdockerCLI(object):
         return container_id
 
     def _stop_container(self, container_id, timeout):
-        """Stop a container using runc/crun"""
-        (engine, executable) = self._runc_engine(container_id)
-        if not executable:
-            return self.STATUS_ERROR
+        """Stop a container with runc/crun or with the monitor signals"""
         container_dir = self.localrepo.cd_container(container_id)
-        if supervisor.stop(container_dir, executable, timeout,
-                           Config.conf['topdir']) != 0:
+        if self._is_runc_mode(container_id):
+            (dummy, executable) = self._runc_engine(container_id)
+            if not executable:
+                return self.STATUS_ERROR
+            status = supervisor.stop(container_dir, executable, timeout,
+                                     Config.conf['topdir'])
+        else:
+            status = supervisor.stop_monitor(container_dir, timeout)
+        if status != 0:
             Msg().err("Error: cannot stop container")
             return self.STATUS_ERROR
         return self.STATUS_OK
@@ -1132,9 +1258,10 @@ class UdockerCLI(object):
         if supervisor.is_running(container_dir):
             Msg().err("Error: container is already running")
             return self.STATUS_ERROR
-        (engine, executable) = self._runc_engine(container_id)
-        if not executable:
-            return self.STATUS_ERROR
+        if self._is_runc_mode(container_id):
+            (dummy, executable) = self._runc_engine(container_id)
+            if not executable:
+                return self.STATUS_ERROR
         if not supervisor.spawn(container_id, container_dir,
                                 conf["argv"], truncate=False):
             return self.STATUS_ERROR
@@ -1176,9 +1303,10 @@ class UdockerCLI(object):
         if not conf.get("argv"):
             Msg().err("Error: container was not started with -d")
             return self.STATUS_ERROR
-        (engine, executable) = self._runc_engine(container_id)
-        if not executable:
-            return self.STATUS_ERROR
+        if self._is_runc_mode(container_id):
+            (dummy, executable) = self._runc_engine(container_id)
+            if not executable:
+                return self.STATUS_ERROR
         if supervisor.is_running(container_dir):
             if self._stop_container(container_id, timeout) != 0:
                 return self.STATUS_ERROR
@@ -1202,11 +1330,19 @@ class UdockerCLI(object):
         if not supervisor.is_running(container_dir):
             Msg().err("Error: container is not running")
             return self.STATUS_ERROR
-        (engine, executable) = self._runc_engine(container_id)
-        if not executable:
-            return self.STATUS_ERROR
-        if supervisor.kill(container_dir, executable, sig,
-                           Config.conf['topdir']) != 0:
+        if self._is_runc_mode(container_id):
+            (dummy, executable) = self._runc_engine(container_id)
+            if not executable:
+                return self.STATUS_ERROR
+            status = supervisor.kill(container_dir, executable, sig,
+                                     Config.conf['topdir'])
+        else:
+            status = supervisor.signal_monitor(container_dir, sig)
+            if (status == 0 and
+                    str(sig).upper().replace("SIG", "") in ("KILL", "9")):
+                supervisor.wait_stopped(container_dir, 3)
+                supervisor.reconcile(container_dir)
+        if status != 0:
             Msg().err("Error: cannot signal container")
             return self.STATUS_ERROR
         Msg().out(container_id)
@@ -1279,12 +1415,129 @@ class UdockerCLI(object):
         if cmdp.missing_options() or not container_id:
             return self.STATUS_ERROR
         container_dir = self.localrepo.cd_container(container_id)
+        supervisor.reconcile(container_dir)
         exitcode = supervisor.wait(container_dir, timeout)
         if exitcode is None:
             Msg().err("Error: timeout waiting for container")
             return self.STATUS_ERROR
         Msg().out(exitcode)
         return self.STATUS_OK
+
+    def _prune_force(self, cmdp):
+        """Accept -f/--force before or after a prune subcommand"""
+        force = bool(cmdp.get("-f") or cmdp.get("--force"))
+        for position in ("P2", "P3"):
+            if cmdp.get(position) in ("-f", "--force"):
+                force = True
+        return force
+
+    def do_top(self, cmdp):
+        """
+        top: display the running processes of a container
+        top <container-id-or-name> [ps options]
+        """
+        container_id = self._resolve_container(cmdp.get("P1"))
+        ps_args = cmdp.get("P+")
+        if cmdp.missing_options() or not container_id:
+            return self.STATUS_ERROR
+        container_dir = self.localrepo.cd_container(container_id)
+        return extras.print_top(container_dir, container_id, ps_args)
+
+    def do_stats(self, cmdp):
+        """
+        stats: display a resource usage snapshot of containers
+        stats [container-id-or-name ...]
+        """
+        names = cmdp.get("P*")
+        if cmdp.missing_options():
+            return self.STATUS_ERROR
+        if not names:
+            containers = [(item[0], self.localrepo.cd_container(item[0]))
+                          for item in self.localrepo.get_containers_list(False)]
+        else:
+            containers = []
+            for name in names:
+                container_id = self._resolve_container(name)
+                if not container_id:
+                    return self.STATUS_ERROR
+                containers.append((container_id,
+                                   self.localrepo.cd_container(container_id)))
+        return extras.print_stats(containers)
+
+    def do_diff(self, cmdp):
+        """
+        diff: inspect changes to a container filesystem
+        diff <container-id-or-name>
+        """
+        container_id = self._resolve_container(cmdp.get("P1"))
+        if cmdp.missing_options() or not container_id:
+            return self.STATUS_ERROR
+        return extras.print_diff(self.localrepo, container_id)
+
+    def do_port(self, cmdp):
+        """
+        port: list the published ports of a container
+        port <container-id-or-name> [private-port[/proto]]
+        """
+        container_id = self._resolve_container(cmdp.get("P1"))
+        mapping = cmdp.get("P2")
+        if cmdp.missing_options() or not container_id:
+            return self.STATUS_ERROR
+        container_dir = self.localrepo.cd_container(container_id)
+        return extras.print_ports(container_dir, mapping)
+
+    def do_system(self, cmdp):
+        """
+        system: udocker data management
+        system df                  :show disk usage
+        system prune [-f]          :remove stopped containers and unused images
+        """
+        subcmd = cmdp.get("P1")
+        if subcmd == "df":
+            if cmdp.missing_options():
+                return self.STATUS_ERROR
+            return extras.print_system_df(self.localrepo)
+        if subcmd == "prune":
+            force = self._prune_force(cmdp)
+            if cmdp.missing_options():
+                return self.STATUS_ERROR
+            return extras.system_prune(self.localrepo, "all", force)
+        if not subcmd:
+            Msg().err("Error: system requires a subcommand: df, prune")
+            return self.STATUS_ERROR
+        if cmdp.missing_options():
+            return self.STATUS_ERROR
+        Msg().err("Error: unknown system subcommand:", subcmd)
+        return self.STATUS_ERROR
+
+    def do_image(self, cmdp):
+        """
+        image: image management
+        image prune [-f]           :remove images not used by containers
+        """
+        subcmd = cmdp.get("P1")
+        if subcmd == "prune":
+            force = self._prune_force(cmdp)
+            if cmdp.missing_options():
+                return self.STATUS_ERROR
+            return extras.system_prune(self.localrepo, "images", force)
+        if subcmd in (None, "ls", "list"):
+            Msg().err("Error: use 'udocker images' to list images")
+            return self.STATUS_ERROR
+        if cmdp.missing_options():
+            return self.STATUS_ERROR
+        Msg().err("Error: unknown image subcommand:", subcmd)
+        return self.STATUS_ERROR
+
+    def do_prune(self, cmdp):
+        """
+        prune: remove stopped containers and unused images
+        prune [-f]
+        """
+        force = self._prune_force(cmdp)
+        if cmdp.missing_options():
+            return self.STATUS_ERROR
+        return extras.system_prune(self.localrepo, "all", force)
 
     def do_images(self, cmdp):
         """
@@ -1367,6 +1620,7 @@ class UdockerCLI(object):
         for (container_id, image, names) in \
                 self.localrepo.get_containers_list(False):
             container_dir = self.localrepo.cd_container(container_id) or ""
+            supervisor.reconcile(container_dir)
             if isinstance(names, (list, tuple)):
                 names = ",".join(names)
             containers.append({
@@ -1452,10 +1706,7 @@ class UdockerCLI(object):
                     Msg().err("Error: container is running, use -f to stop it")
                     exit_status = self.STATUS_ERROR
                     continue
-                (engine, executable) = self._runc_engine(container_id)
-                if executable:
-                    supervisor.stop(container_dir, executable, 10,
-                                    Config.conf['topdir'])
+                self._stop_container(container_id, 10)
 
             Msg().out("Info: deleting container:",
                       str(container_id), l=Msg.INF)
@@ -2214,7 +2465,7 @@ Commands:
   create <repo/image:tag>       :Create container from a pulled image
   run <container_id|name>       :Execute created container
   run <repo/image:tag>          :Pull, create and execute container
-  run -d <container>            :Execute container in background (Rn modes)
+  run -d <container>            :Execute container in background (all modes)
   start <container>             :Start a container created with run -d
   stop <container>              :Stop a running container
   restart <container>           :Stop and start a container
@@ -2222,12 +2473,19 @@ Commands:
   exec <container> <command>    :Execute a command in a running container
   logs [-f] <container>         :Show the log of a container
   wait <container>              :Wait for a container and print its exit code
+  top <container> [ps args]     :Show the running processes of a container
+  stats [container ...]         :Show CPU memory and pids of containers
+  diff <container>              :Show filesystem changes of a container
+  port <container> [port]       :Show published ports of a container
   build -t <repo/image:tag> <path> :Build image from a Dockerfile
   commit <container> <repo/image:tag> :Create an image from a container
 
   images -l                     :List container images
   history <repo/image:tag>      :List the layers of an image
   ps -m -s                      :List created containers
+  system df                     :Show disk usage of images and containers
+  system prune [-f]             :Remove stopped containers and unused images
+  image prune [-f]              :Remove images not used by containers
   cp <container>:<path> <host-path> :Copy files from container to host
   cp <host-path> <container>:<path> :Copy files from host to container
   name <container_id> <name>    :Give name to container
@@ -2276,6 +2534,11 @@ Examples:
   udocker images
   udocker create --name=mycontainer  myimage:mytag
   udocker ps -m -s
+  udocker top mycontainer ps aux
+  udocker stats mycontainer
+  udocker diff mycontainer
+  udocker port mycontainer 80/tcp
+  udocker system df
   udocker inspect mycontainer
   udocker inspect -p mycontainer
 

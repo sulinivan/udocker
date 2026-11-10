@@ -4,7 +4,6 @@
 import os
 import sys
 import re
-import subprocess
 
 from udocker.genstr import is_genstr
 from udocker.msg import Msg
@@ -59,6 +58,8 @@ class FakechrootEngine(ExecutionEngineCommon):
 
         f_util = FileUtil(self.localrepo.libdir)
         fakechroot_so = f_util.find_file_in_dir(image_list)
+        if not fakechroot_so:
+            fakechroot_so = self._find_fallback_fakechroot(arch)
         if os.path.basename(fakechroot_so).count('-') != 3:
             Msg().out("Info: this OS or architecture might not be supported by",
                       "this execution mode",
@@ -72,6 +73,28 @@ class FakechrootEngine(ExecutionEngineCommon):
 
         Msg().out("Debug: fakechroot_so:", fakechroot_so, l=Msg.DBG)
         return fakechroot_so
+
+    def _find_fallback_fakechroot(self, arch):
+        """Pick a fakechroot library built for this architecture
+
+        Distributions missing from the bundled set (e.g. Gentoo) can use
+        any library built for the same architecture: libfakechroot is a
+        host side preload and the guest distribution is mostly irrelevant.
+        """
+        try:
+            names = sorted(os.listdir(self.localrepo.libdir))
+        except (IOError, OSError, TypeError):
+            return ""
+        for name in names:
+            if not (name.startswith("libfakechroot") and
+                    name.endswith(".so")):
+                continue
+            if arch in name or name == "libfakechroot.so":
+                path = os.path.join(self.localrepo.libdir, name)
+                Msg().out("Warning: using fallback fakechroot library:",
+                          path, l=Msg.WAR)
+                return path
+        return ""
 
     def _get_libc_pathname(self):
         """Get the pathname of libc in the container"""
@@ -222,13 +245,11 @@ class FakechrootEngine(ExecutionEngineCommon):
                                        self._elfpatcher.get_patch_last_time())
 
     def _run_invalid_options(self):
-        """check -p --publish -P --publish-all --net-coop"""
-        if self.opt["portsmap"]:
-            Msg().out("Warning: this execution mode does not support "
-                      "-p --publish", l=Msg.WAR)
-        if self.opt["netcoop"]:
-            Msg().out("Warning: this execution mode does not support "
-                      "-P --netcoop --publish-all", l=Msg.WAR)
+        """Port publishing is handled by PRoot (P modes) or by the
+        userspace TCP forwarder started by the CLI (F/R/S modes);
+        there is nothing to reject here.
+        """
+        return
 
     def _run_add_script_support(self, exec_path):
         """Add an interpreter for non binary executables (scripts)"""
@@ -315,5 +336,4 @@ class FakechrootEngine(ExecutionEngineCommon):
         self._run_banner(self.opt["cmd"][0], '#')
         cwd = FileUtil(self.container_root).cont2host(self.opt["cwd"],
                                                       self.opt["vol"])
-        status = subprocess.call(cmd_l, shell=False, close_fds=False, cwd=cwd)
-        return status
+        return self._exec_command(cmd_l, cwd=cwd)

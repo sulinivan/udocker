@@ -120,3 +120,6 @@ ENV/
 
 rm-udtmp.sh
 udocker/udocker
+
+# DSH project skills (local, not part of udocker)
+/.agents/
