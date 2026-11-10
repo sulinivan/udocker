@@ -598,6 +598,52 @@ class UdockerCLI(object):
             pass
 
     @staticmethod
+    def _valid_restart_policy(policy):
+        """Is the restart policy one docker understands"""
+        text = str(policy or "").strip().lower()
+        if text in ("no", "always", "unless-stopped", "on-failure"):
+            return True
+        if text.startswith("on-failure:"):
+            return text.split(":", 1)[1].isdigit()
+        return False
+
+    @staticmethod
+    def _restart_requested(policy, exit_status, container_dir):
+        """Should the detached monitor run the container again"""
+        text = str(policy or "").strip().lower()
+        if not text or text == "no":
+            return False
+        if not isinstance(container_dir, str) or not container_dir:
+            return False
+        if os.path.exists(os.path.join(container_dir,
+                                       supervisor.STOPPING_NAME)):
+            return False
+        if text in ("always", "unless-stopped"):
+            return True
+        if not text.startswith("on-failure") or exit_status == 0:
+            return False
+        if ":" not in text:
+            return True
+        try:
+            maximum = int(text.split(":", 1)[1])
+        except ValueError:
+            return False
+        count_file = os.path.join(container_dir, "restarts")
+        try:
+            with open(count_file, "r") as filep:
+                count = int(filep.read().strip() or 0)
+        except (IOError, OSError, ValueError):
+            count = 0
+        if count >= maximum:
+            return False
+        try:
+            with open(count_file, "w") as filep:
+                filep.write(str(count + 1))
+        except (IOError, OSError):
+            return False
+        return True
+
+    @staticmethod
     def _stop_config(container_dir):
         """Signal and timeout recorded for docker stop"""
         if not isinstance(container_dir, str):
@@ -1316,6 +1362,14 @@ class UdockerCLI(object):
                 "fl": ("--stop-timeout=",), "act": 'R',
                 "p2": "CMD_OPT", "p3": False
             },
+            "restart": {
+                "fl": ("--restart=",), "act": 'R',
+                "p2": "CMD_OPT", "p3": False
+            },
+            "restartmonitor": {
+                "fl": ("--restart-monitor",), "act": 'R',
+                "p2": "CMD_OPT", "p3": False
+            },
             "nobanner": {
                 "fl": ("--nobanner",), "act": 'R',
                 "p2": "CMD_OPT", "p3": False
@@ -1471,6 +1525,16 @@ class UdockerCLI(object):
         opt = exec_engine.opt
         if not isinstance(opt, dict):
             opt = {}
+        monitor = bool(opt.get("restartmonitor"))
+        restart_policy = str(opt.get("restart") or "").strip().lower()
+        if restart_policy and not self._valid_restart_policy(restart_policy):
+            Msg().err("Error: invalid restart policy:", restart_policy)
+            return self.STATUS_ERROR
+        if delete and restart_policy not in ("", "no"):
+            Msg().err("Error: --rm cannot be combined with a restart policy")
+            return self.STATUS_ERROR
+        saved_environ = dict(os.environ) if monitor else {}
+        monitor_argv = list(sys.argv) if monitor else []
         container_dir = ""
         if not Config.conf['location']:
             container_dir = self.localrepo.cd_container(container_id)
@@ -1527,6 +1591,20 @@ class UdockerCLI(object):
         self._write_state(container_dir, "exited", exitcode=exit_status)
         if delete and not self.localrepo.isprotected_container(container_id):
             self.localrepo.del_container(container_id)
+        if (monitor and not delete and
+                self._restart_requested(restart_policy, exit_status,
+                                        container_dir)):
+            Msg().out("Info: restarting container:", container_id, l=Msg.INF)
+            time.sleep(1)
+            for key in list(os.environ):
+                os.environ.pop(key, None)
+            os.environ.update(saved_environ)
+            try:
+                os.execv(sys.executable,
+                         [sys.executable, "-m", "udocker.maincmd"] +
+                         monitor_argv[1:])
+            except (OSError, ValueError):
+                pass
 
         return exit_status
 
@@ -1556,6 +1634,8 @@ class UdockerCLI(object):
             return []
         if "--nobanner" not in rest:
             rest.insert(run_index + 1, "--nobanner")
+        if "--restart-monitor" not in rest:
+            rest.insert(run_index + 1, "--restart-monitor")
         # -P was expanded by the parent: hand the explicit mappings to the
         # monitor so it does not pick a different set of random ports
         if not netcoop:
@@ -1581,6 +1661,11 @@ class UdockerCLI(object):
         if supervisor.is_running(container_dir):
             Msg().err("Error: container is already running")
             return self.STATUS_ERROR
+        supervisor.clear_stopped(container_dir)
+        try:
+            os.remove(os.path.join(container_dir, "restarts"))
+        except OSError:
+            pass
         argv = self._detach_argv(container_id, container_or_image,
                                  ports, netcoop)
         if not argv:
@@ -1661,6 +1746,11 @@ class UdockerCLI(object):
             (dummy, executable) = self._runc_engine(container_id)
             if not executable:
                 return self.STATUS_ERROR
+        supervisor.clear_stopped(container_dir)
+        try:
+            os.remove(os.path.join(container_dir, "restarts"))
+        except OSError:
+            pass
         if not supervisor.spawn(container_id, container_dir,
                                 conf["argv"], truncate=False):
             return self.STATUS_ERROR
@@ -1765,6 +1855,11 @@ class UdockerCLI(object):
             if self._stop_container(container_id, timeout,
                                     stop_signal) != 0:
                 return self.STATUS_ERROR
+        supervisor.clear_stopped(container_dir)
+        try:
+            os.remove(os.path.join(container_dir, "restarts"))
+        except OSError:
+            pass
         if not supervisor.spawn(container_id, container_dir,
                                 conf["argv"], truncate=False):
             return self.STATUS_ERROR

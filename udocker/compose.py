@@ -33,7 +33,8 @@ SUPPORTED_KEYS = ("image", "build", "container_name", "command",
                   "entrypoint", "environment", "env_file", "ports",
                   "volumes", "working_dir", "user", "labels", "depends_on",
                   "hostname", "extra_hosts", "ulimits", "networks",
-                  "network_mode", "stop_signal", "stop_grace_period")
+                  "network_mode", "stop_signal", "stop_grace_period",
+                  "restart")
 
 ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}"
                          r"|\$([A-Za-z_][A-Za-z0-9_]*)")
@@ -756,6 +757,7 @@ def normalize_service(project, service, config, compose_dir,
         "ulimits": parse_ulimits(config.get("ulimits")),
         "stop_signal": str(config.get("stop_signal") or ""),
         "stop_timeout": parse_duration(config.get("stop_grace_period")),
+        "restart": str(config.get("restart") or ""),
         "depends_on": parse_depends_on(config.get("depends_on")),
     }
 
@@ -803,6 +805,8 @@ def run_arguments(plan):
         args.append("--stop-signal=" + plan["stop_signal"])
     if plan.get("stop_timeout") is not None:
         args.append("--stop-timeout=" + str(plan["stop_timeout"]))
+    if plan.get("restart"):
+        args.append("--restart=" + plan["restart"])
     args.append(plan["container_name"])
     args.extend(plan["command"])
     return args
@@ -1397,8 +1401,9 @@ def do_compose(cli, cmdp):
     build sections via udocker build, named volumes ("name:/path" becomes
     <project>_<name> unless the top-level volumes section sets name: or
     external: true), hostname/extra_hosts/labels, env_file, .env
-    substitution, ulimits, stop_signal/stop_grace_period; service networks
-    and network_mode are accepted (everything shares the host network).
+    substitution, ulimits, stop_signal/stop_grace_period and restart
+    policies; service networks and network_mode are accepted (everything
+    shares the host network).
     """
     consume = getattr(cmdp, "consume_all", None)
     if consume is not None:

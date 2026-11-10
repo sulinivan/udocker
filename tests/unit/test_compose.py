@@ -358,6 +358,7 @@ class ComposeProjectTestCase(TestCase):
             "    env_file: ./app.env\n"
             "    environment:\n"
             "      B: from-compose\n"
+            "    restart: unless-stopped\n"
             "    stop_signal: SIGQUIT\n"
             "    stop_grace_period: 1m30s\n"
             "    networks: [backend]\n"
@@ -384,6 +385,7 @@ class ComposeProjectTestCase(TestCase):
         self.assertIn("A=file", plan["environment"])
         self.assertIn("B=from-compose", plan["environment"])
         self.assertEqual(plan["ulimits"], ["nofile=128", "nproc=16:32"])
+        self.assertEqual(plan["restart"], "unless-stopped")
         self.assertEqual(plan["stop_signal"], "SIGQUIT")
         self.assertEqual(plan["stop_timeout"], 90)
         self.assertNotIn("networks", errors.getvalue())
@@ -392,6 +394,7 @@ class ComposeProjectTestCase(TestCase):
         self.assertIn("--env=B=from-compose", args)
         self.assertIn("--ulimit=nofile=128", args)
         self.assertIn("--ulimit=nproc=16:32", args)
+        self.assertIn("--restart=unless-stopped", args)
         self.assertIn("--stop-signal=SIGQUIT", args)
         self.assertIn("--stop-timeout=90", args)
 

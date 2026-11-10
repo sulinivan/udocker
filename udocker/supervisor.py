@@ -23,6 +23,7 @@ from udocker.utils.containerpath import container_realpath
 STATE_NAME = "state.json"
 CONF_NAME = "supervisor.json"
 LOG_NAME = os.path.join("logs", "container.log")
+STOPPING_NAME = "stopping"
 
 
 def log_path(container_dir):
@@ -220,6 +221,10 @@ def spawn(container_id, container_dir, argv, truncate=True, timeout=15):
     write_conf(container_dir, argv, log)
     if wait_running(container_dir, proc, timeout):
         return True
+    # a very short command can exit before the parent observes "running":
+    # the monitor is alive, the container simply finished already
+    if read_state(container_dir).get("status") in ("exited", "interrupted"):
+        return True
     try:
         proc.terminate()
     except OSError:
@@ -358,11 +363,29 @@ def wait_stopped(container_dir, timeout=10):
     return False
 
 
+def mark_stopped(container_dir):
+    """Flag an explicit stop so a restart policy does not resurrect it"""
+    try:
+        with open(os.path.join(container_dir, STOPPING_NAME), "w"):
+            pass
+    except (IOError, OSError):
+        pass
+
+
+def clear_stopped(container_dir):
+    """Remove the explicit-stop flag before starting a container"""
+    try:
+        os.remove(os.path.join(container_dir, STOPPING_NAME))
+    except OSError:
+        pass
+
+
 def stop_monitor(container_dir, timeout=10, sig="TERM"):
     """Stop a container whose engine has no runc control channel"""
     if not is_running(container_dir):
         reconcile(container_dir)
         return 0
+    mark_stopped(container_dir)
     if signal_monitor(container_dir, sig) != 0:
         return 1
     if wait_stopped(container_dir, timeout):
@@ -380,6 +403,7 @@ def stop(container_dir, executable, timeout=10, topdir="", sig="TERM"):
     """Stop a container: signal, wait, then kill"""
     if not is_running(container_dir):
         return 0
+    mark_stopped(container_dir)
     kill(container_dir, executable, sig, topdir)
     deadline = time.time() + float(timeout)
     while time.time() < deadline:

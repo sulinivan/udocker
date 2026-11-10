@@ -172,5 +172,27 @@ class SupervisorTestCase(TestCase):
         self.assertEqual(state["exitcode"], 137)
 
 
+    def test_12_stop_marker(self):
+        """Test12 explicit stop marker and short-exit spawn"""
+        supervisor.mark_stopped(self.container_dir)
+        self.assertTrue(os.path.exists(
+            os.path.join(self.container_dir, supervisor.STOPPING_NAME)))
+        supervisor.clear_stopped(self.container_dir)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.container_dir, supervisor.STOPPING_NAME)))
+        proc = Mock()
+        proc.pid = os.getpid()
+        proc.poll.return_value = None
+        with patch('udocker.supervisor.subprocess.Popen',
+                   return_value=proc), \
+                patch('udocker.supervisor.wait_running',
+                      return_value=False), \
+                patch('udocker.supervisor.read_state',
+                      return_value={"status": "exited"}), \
+                patch('udocker.supervisor._devnull'):
+            self.assertTrue(supervisor.spawn(
+                self.container_id, self.container_dir, ["run", "CID"]))
+
+
 if __name__ == '__main__':
     main()

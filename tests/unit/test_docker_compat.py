@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 from udocker.cli import UdockerCLI
 from udocker.cmdparser import CmdParser
 from udocker.config import Config
+from udocker import supervisor
 from udocker.umain import expand_compat_argv
 
 
@@ -330,6 +331,32 @@ class DockerCompatOutputTestCase(TestCase):
             mock_exec.return_value.get_mode.return_value = "P1"
             self.assertEqual(cli.do_stop(cmdp), 0)
         mock_stop.assert_called_once_with(container_dir, 5, sig="SIGQUIT")
+
+    def test_10_restart_policy(self):
+        """Test10 restart policy validation, counters and stop marker"""
+        cli = self._cli(Mock())
+        for policy in ("always", "unless-stopped", "on-failure",
+                       "on-failure:3", "no"):
+            self.assertTrue(cli._valid_restart_policy(policy), policy)
+        for policy in ("sometimes", "on-failure:x", "", None):
+            self.assertFalse(cli._valid_restart_policy(policy), policy)
+        container_dir = self._container_dir(
+            "rs1", {"status": "exited", "exitcode": 3})
+        self.assertTrue(cli._restart_requested("always", 0, container_dir))
+        self.assertFalse(cli._restart_requested("on-failure", 0,
+                                                container_dir))
+        self.assertTrue(cli._restart_requested("on-failure", 3,
+                                               container_dir))
+        self.assertTrue(cli._restart_requested("on-failure:2", 3,
+                                               container_dir))
+        self.assertTrue(cli._restart_requested("on-failure:2", 3,
+                                               container_dir))
+        self.assertFalse(cli._restart_requested("on-failure:2", 3,
+                                                container_dir))
+        supervisor.mark_stopped(container_dir)
+        self.assertFalse(cli._restart_requested("always", 3, container_dir))
+        supervisor.clear_stopped(container_dir)
+
 
 if __name__ == '__main__':
     main()
