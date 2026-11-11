@@ -1793,9 +1793,23 @@ def _option_int(options, flag, default=None):
         raise ComposeError("invalid %s value: %s" % (flag, value))
 
 
+def _env_compose_files():
+    """Compose files listed in the COMPOSE_FILE environment variable"""
+    value = os.environ.get("COMPOSE_FILE", "")
+    if not value.strip():
+        return []
+    separator = os.environ.get("COMPOSE_PATH_SEPARATOR") or os.pathsep
+    return [path for path in value.split(separator) if path]
+
+
+def _env_project_name():
+    """Project name from the COMPOSE_PROJECT_NAME environment variable"""
+    return os.environ.get("COMPOSE_PROJECT_NAME") or None
+
+
 def _load_project(options):
     """Load the compose file selected by the global and command options"""
-    files = _option_list(options, "--file")
+    files = _option_list(options, "--file") or _env_compose_files()
     if files:
         for path in files:
             if not os.path.isfile(path):
@@ -1813,7 +1827,8 @@ def _load_project(options):
             raise ComposeError("project directory not found: %s" % directory)
     return ComposeProject(
         files,
-        name=_option_text(options, "--project-name"),
+        name=(_option_text(options, "--project-name") or
+              _env_project_name()),
         directory=directory,
         env_files=_option_list(options, "--env-file"),
         profiles=_option_list(options, "--profile"),
@@ -3062,7 +3077,7 @@ def do_compose(cli, cmdp):
     compose [globals] <command> [options] [services...]
     -f, --file=<file>          :compose file, repeatable (default: compose.yaml,
                                 compose.yml, udocker-compose.yml/..yaml,
-                                docker-compose.yml or .yaml)
+                                docker-compose.yml or .yaml; $COMPOSE_FILE)
     -p, --project-name=<name>  :project name (default: name field or directory)
     --project-directory=<dir>  :base directory for relative paths
     --env-file=<file>          :environment file used for interpolation

@@ -737,6 +737,33 @@ class ComposeCommandTestCase(TestCase):
         canonical = write_compose(directory)
         self.assertEqual(compose.find_compose_file(directory), canonical)
 
+    def test_25_compose_file_env(self):
+        """Test25 $COMPOSE_FILE and $COMPOSE_PROJECT_NAME work from elsewhere"""
+        directory = os.path.join(self.base, "envproj")
+        os.makedirs(directory)
+        path = write_compose(directory,
+                             "services:\n  web:\n    image: busybox\n",
+                             name="udocker-compose.yml")
+        elsewhere = os.path.join(self.base, "elsewhere")
+        os.makedirs(elsewhere)
+        cwd = os.getcwd()
+        os.chdir(elsewhere)
+        try:
+            with patch.dict(os.environ, {"COMPOSE_FILE": path}):
+                (status, out, errors, dummy, dummy2) = self.run_compose(
+                    ["config"])
+            self.assertEqual(status, 0)
+            self.assertEqual(errors, "")
+            self.assertIn("busybox", out)
+            with patch.dict(os.environ, {"COMPOSE_FILE": path,
+                                         "COMPOSE_PROJECT_NAME": "Env"}):
+                (status, out, errors, dummy, dummy2) = self.run_compose(
+                    ["ps"])
+            self.assertEqual(status, 0)
+            self.assertIn("project env", out)
+        finally:
+            os.chdir(cwd)
+
     def test_23_missing_compose_file(self):
         """Test23 the default compose file names are searched in the cwd"""
         self.assertEqual(compose.find_compose_file(self.base), self.path)
