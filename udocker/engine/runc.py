@@ -314,13 +314,15 @@ class RuncEngine(ExecutionEngineCommon):
         (host_dir, cont_dir) = self._filebind.start(Config.conf['sysdirs_list'])
         self._add_mount_spec(host_dir, cont_dir, rwmode=True)
         for vol in self.opt["vol"]:
-            (host_dir, cont_dir) = Uvolume(vol).split()
+            uvolume = Uvolume(vol)
+            (host_dir, cont_dir) = uvolume.split()
             if os.path.isdir(host_dir):
                 if host_dir == "/dev":
                     Msg().out("Warning: engine does not support -v",
                               host_dir, l=Msg.WAR)
                     continue
-                self._add_mount_spec(host_dir, cont_dir, rwmode=True)
+                self._add_mount_spec(host_dir, cont_dir,
+                                     rwmode=not uvolume.readonly)
             elif os.path.isfile(host_dir):
                 if (host_dir not in Config.conf['sysdirs_list'] and
                         host_dir + ":" + cont_dir not in self.hostauth_list and

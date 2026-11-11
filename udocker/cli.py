@@ -829,8 +829,9 @@ class UdockerCLI(object):
             fields = {}
             for part in str(spec).split(","):
                 key, separator, value = part.partition("=")
-                if separator:
-                    fields[key.strip().lower()] = value.strip()
+                if not separator:
+                    value = "true"           # bare "readonly" flag
+                fields[key.strip().lower()] = value.strip()
             kind = fields.get("type", "volume")
             source = (fields.get("source") or fields.get("src") or "")
             target = (fields.get("target") or fields.get("dst") or
@@ -844,7 +845,11 @@ class UdockerCLI(object):
                 return "invalid --mount bind source: %s" % spec
             if kind not in ("bind", "volume"):
                 return "unsupported --mount type: %s" % kind
-            opt.setdefault("vol", []).append("%s:%s" % (source, target))
+            readonly = (fields.get("readonly", "").lower() in
+                        ("1", "true", "yes") or
+                        fields.get("ro", "").lower() in ("1", "true", "yes"))
+            opt.setdefault("vol", []).append(
+                "%s:%s%s" % (source, target, ":ro" if readonly else ""))
         return ""
 
     @staticmethod

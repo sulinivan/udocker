@@ -45,6 +45,29 @@ class UvolumeTestCase(TestCase):
         result = uvol.split()
         self.assertEqual(result, ('/data', '/data'))
 
+    def test_04_split_modes(self):
+        """Test04 Uvolume().split() with docker volume modes."""
+        uvol = Uvolume('/data:/contdata:ro')
+        self.assertEqual(uvol.split(), ('/data', '/contdata'))
+        self.assertEqual(uvol.mode, 'ro')
+        self.assertTrue(uvol.readonly)
+
+        uvol = Uvolume('/data:/contdata:ro,Z')
+        self.assertEqual(uvol.split(), ('/data', '/contdata'))
+        self.assertTrue(uvol.readonly)
+
+        uvol = Uvolume('/data:/contdata:rw')
+        self.assertEqual(uvol.split(), ('/data', '/contdata'))
+        self.assertFalse(uvol.readonly)
+
+        uvol = Uvolume('/data:/cont:weird')
+        self.assertEqual(uvol.split(), ('/data', '/cont:weird'))
+        self.assertEqual(uvol.mode, '')
+        self.assertFalse(uvol.readonly)
+
+        uvol = Uvolume('/data')
+        self.assertEqual(uvol.split(), ('/data', '/data'))
+
 
 if __name__ == '__main__':
     main()

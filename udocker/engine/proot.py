@@ -110,7 +110,12 @@ class PRootEngine(ExecutionEngineCommon):
         """Get the volume bindings string for container run command"""
         proot_vol_list = []
         for vol in self.opt["vol"]:
-            proot_vol_list.extend(["-b", "%s:%s" % Uvolume(vol).split()])
+            uvolume = Uvolume(vol)
+            (host_path, cont_path) = uvolume.split()
+            if uvolume.readonly:
+                Msg().out("Warning: read-only bind mounted read-write"
+                          " (proot cannot enforce ro):", vol, l=Msg.WAR)
+            proot_vol_list.extend(["-b", "%s:%s" % (host_path, cont_path)])
         return proot_vol_list
 
     def _get_network_map(self):

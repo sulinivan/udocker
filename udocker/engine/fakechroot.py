@@ -138,9 +138,14 @@ class FakechrootEngine(ExecutionEngineCommon):
         map_volumes_list = []
         map_volumes_dict = {}
         for vol in self.opt["vol"]:
-            (host_path, cont_path) = Uvolume(vol).split()
+            uvolume = Uvolume(vol)
+            (host_path, cont_path) = uvolume.split()
             if not (host_path and cont_path):
                 continue
+            if uvolume.readonly:
+                Msg().out("Warning: read-only bind mounted read-write"
+                          " (fakechroot cannot enforce ro):", vol,
+                          l=Msg.WAR)
             real_host_path = os.path.realpath(host_path)
             if (host_path == cont_path and
                     Config.conf['fakechroot_expand_symlinks'] is False):
