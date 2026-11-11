@@ -120,6 +120,8 @@ class DockerCompatOutputTestCase(TestCase):
         exited = self._container_dir(
             "ex1", {"status": "exited", "exitcode": 0,
                     "timestamp": "2026-11-10T10:00:00Z", "ports": []})
+        with open(os.path.join(running, "health.json"), "w") as filep:
+            json.dump({"Status": "healthy", "FailingStreak": 0}, filep)
         localrepo = self._localrepo({"run1": (running, ["web"]),
                                      "ex1": (exited, [])})
         out = self._run_ps(localrepo)
@@ -128,6 +130,7 @@ class DockerCompatOutputTestCase(TestCase):
         self.assertIn("PORTS", out)
         self.assertIn("web", out)
         self.assertIn("0.0.0.0:18080->80/tcp", out)
+        self.assertIn("(healthy)", out)
         self.assertNotIn("ex1", out)
         out_all = self._run_ps(localrepo, "-a")
         self.assertIn("ex1", out_all)
@@ -202,6 +205,8 @@ class DockerCompatOutputTestCase(TestCase):
             json.dump(["vol1:/data"], fp)
         with open(os.path.join(container_dir, "labels.json"), "w") as fp:
             json.dump({"team": "infra"}, fp)
+        with open(os.path.join(container_dir, "health.json"), "w") as fp:
+            json.dump({"Status": "unhealthy", "FailingStreak": 2}, fp)
         self.assertTrue(repo.create_volume("vol1"))
         self.assertTrue(repo.set_container_name(cid, "web"))
         cli = self._cli(repo)
@@ -220,6 +225,7 @@ class DockerCompatOutputTestCase(TestCase):
         self.assertEqual(data[0]["Mounts"][0]["Name"], "vol1")
         self.assertEqual(data[0]["HostConfig"]["NetworkMode"], "host")
         self.assertEqual(data[0]["Config"]["Labels"], {"team": "infra"})
+        self.assertEqual(data[0]["State"]["Health"]["Status"], "unhealthy")
         cmdp = CmdParser()
         cmdp.parse(["udocker", "inspect", "-f", "{{.State.ExitCode}}",
                     "--type=container", cid])
@@ -436,6 +442,29 @@ class DockerCompatOutputTestCase(TestCase):
         lines = out.splitlines()
         self.assertEqual(lines[0].split(), ["ID", "NAMES"])
         self.assertIn("web", lines[1])
+
+    def test_14_health_config(self):
+        """Test14 run health flags override image healthcheck metadata"""
+        container_dir = self._container_dir(
+            "hc1", {"status": "created"})
+        with open(os.path.join(container_dir, "container.json"), "w") as fp:
+            json.dump({"config": {"Healthcheck": {
+                "Test": ["CMD", "true"], "Interval": 30000000000,
+                "Retries": 3}}}, fp)
+        cli = self._cli(Mock())
+        config = cli._health_config(container_dir, {
+            "healthcmd": "curl -f http://x", "healthinterval": "5s",
+            "healthretries": "2", "healthstartperiod": "1m"})
+        self.assertEqual(config["Test"],
+                         ["CMD-SHELL", "curl -f http://x"])
+        self.assertEqual(config["Interval"], 5.0)
+        self.assertEqual(config["Retries"], 2)
+        self.assertEqual(config["StartPeriod"], 60.0)
+        image_config = cli._health_config(container_dir, {})
+        self.assertEqual(image_config["Test"], ["CMD", "true"])
+        self.assertEqual(image_config["Interval"], 30.0)
+        self.assertIsNone(cli._health_config(container_dir,
+                                             {"healthcmd": "NONE"}))
 
 if __name__ == '__main__':
     main()

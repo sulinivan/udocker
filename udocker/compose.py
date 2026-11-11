@@ -34,7 +34,7 @@ SUPPORTED_KEYS = ("image", "build", "container_name", "command",
                   "volumes", "working_dir", "user", "labels", "depends_on",
                   "hostname", "extra_hosts", "ulimits", "networks",
                   "network_mode", "stop_signal", "stop_grace_period",
-                  "restart")
+                  "restart", "healthcheck")
 
 ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}"
                          r"|\$([A-Za-z_][A-Za-z0-9_]*)")
@@ -645,6 +645,30 @@ def parse_duration(value):
     return total
 
 
+def parse_healthcheck(value):
+    """Normalize a compose healthcheck mapping to docker-ish fields"""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ComposeError("healthcheck must be a mapping")
+    if value.get("disable"):
+        return {"test": ["NONE"]}
+    test = value.get("test")
+    if isinstance(test, list):
+        test = [str(item) for item in test]
+    elif test is not None:
+        test = ["CMD-SHELL", str(test)]
+    result = {"test": test}
+    for key in ("interval", "timeout", "start_period"):
+        result[key] = parse_duration(value.get(key))
+    retries = value.get("retries")
+    try:
+        result["retries"] = int(retries) if retries is not None else None
+    except (TypeError, ValueError):
+        raise ComposeError("healthcheck retries must be a number")
+    return result
+
+
 def parse_extra_hosts(value):
     """Normalize extra_hosts to a list of host:ip entries"""
     result = []
@@ -758,6 +782,7 @@ def normalize_service(project, service, config, compose_dir,
         "stop_signal": str(config.get("stop_signal") or ""),
         "stop_timeout": parse_duration(config.get("stop_grace_period")),
         "restart": str(config.get("restart") or ""),
+        "healthcheck": parse_healthcheck(config.get("healthcheck")),
         "depends_on": parse_depends_on(config.get("depends_on")),
     }
 
@@ -807,6 +832,20 @@ def run_arguments(plan):
         args.append("--stop-timeout=" + str(plan["stop_timeout"]))
     if plan.get("restart"):
         args.append("--restart=" + plan["restart"])
+    health = plan.get("healthcheck") or {}
+    test = health.get("test")
+    if test:
+        if test[0] == "NONE":
+            args.append("--health-cmd=NONE")
+        else:
+            args.append("--health-cmd=" + " ".join(test[1:]))
+    for key, flag in (("interval", "--health-interval="),
+                      ("timeout", "--health-timeout="),
+                      ("start_period", "--health-start-period=")):
+        if health.get(key) is not None:
+            args.append(flag + "%gs" % health[key])
+    if health.get("retries") is not None:
+        args.append("--health-retries=%d" % health["retries"])
     args.append(plan["container_name"])
     args.extend(plan["command"])
     return args
@@ -1401,9 +1440,9 @@ def do_compose(cli, cmdp):
     build sections via udocker build, named volumes ("name:/path" becomes
     <project>_<name> unless the top-level volumes section sets name: or
     external: true), hostname/extra_hosts/labels, env_file, .env
-    substitution, ulimits, stop_signal/stop_grace_period and restart
-    policies; service networks and network_mode are accepted (everything
-    shares the host network).
+    substitution, ulimits, stop_signal/stop_grace_period, restart policies
+    and healthcheck (executed in R execution modes); service networks and
+    network_mode are accepted (everything shares the host network).
     """
     consume = getattr(cmdp, "consume_all", None)
     if consume is not None:

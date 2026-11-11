@@ -6,6 +6,7 @@ container state, so start/stop/kill/exec/logs/wait work without root
 and without a system daemon.
 """
 
+import calendar
 import os
 import signal
 import subprocess
@@ -24,6 +25,8 @@ STATE_NAME = "state.json"
 CONF_NAME = "supervisor.json"
 LOG_NAME = os.path.join("logs", "container.log")
 STOPPING_NAME = "stopping"
+HEALTH_NAME = "health.json"
+HEALTH_CONFIG_NAME = "health-config.json"
 
 
 def log_path(container_dir):
@@ -488,7 +491,7 @@ def _find_group(container_dir, name):
 
 def exec_command(container_dir, executable, command,
                  user=None, workdir=None, env_vars=None, tty=False,
-                 topdir=""):
+                 topdir="", capture=False):
     """Execute a command inside a running container with runc exec"""
     rid = runc_container_id(os.path.basename(container_dir))
     args = [executable, "--root", container_dir, "exec"]
@@ -503,6 +506,16 @@ def exec_command(container_dir, executable, command,
     args.append(rid)
     args.extend(command)
     Msg().out("Debug: runc exec:", " ".join(args), l=Msg.DBG)
+    if capture:
+        try:
+            completed = subprocess.run(
+                args, env=runtime_env(topdir), close_fds=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                universal_newlines=True)
+            return (completed.returncode, completed.stdout or "")
+        except (OSError, ValueError) as error:
+            Msg().err("Error: invoking runc exec:", str(error))
+            return (1, str(error))
     try:
         return subprocess.call(args, env=runtime_env(topdir),
                                close_fds=True)
@@ -576,3 +589,133 @@ def _write_bytes(data):
         sys.stdout.flush()
     except (IOError, OSError):
         pass
+
+
+def _read_json_file(path):
+    """Read a JSON mapping from a file, empty dict on any problem"""
+    try:
+        with open(path, "r") as filep:
+            data = json.load(filep)
+    except (IOError, OSError, ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_json_file(path, data):
+    try:
+        with open(path, "w") as filep:
+            json.dump(data, filep)
+    except (IOError, OSError, ValueError, TypeError):
+        pass
+
+
+def _timestamp_epoch(timestamp):
+    """Epoch seconds of an ISO-8601 UTC timestamp, None when invalid"""
+    try:
+        return calendar.timegm(
+            time.strptime(str(timestamp)[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def health_config(container_dir):
+    """Healthcheck configuration saved by run, empty when absent"""
+    return _read_json_file(os.path.join(container_dir, HEALTH_CONFIG_NAME))
+
+
+def write_health_config(container_dir, config):
+    """Store the merged healthcheck configuration of a container"""
+    if config:
+        _write_json_file(os.path.join(container_dir, HEALTH_CONFIG_NAME),
+                         config)
+
+
+def health_status(container_dir):
+    """Last healthcheck result, empty when absent"""
+    return _read_json_file(os.path.join(container_dir, HEALTH_NAME))
+
+
+def _health_command(test):
+    """Command arguments from a docker Healthcheck Test list"""
+    test = [str(item) for item in (test or [])]
+    if not test or test[0] == "NONE":
+        return []
+    if test[0] == "CMD-SHELL":
+        return ["/bin/sh", "-c", " ".join(test[1:])]
+    return test[1:]
+
+
+def healthcheck_once(container_dir, executable, topdir=""):
+    """Run one healthcheck, update health.json, return the new status"""
+    config = health_config(container_dir)
+    command = _health_command(config.get("Test"))
+    if not command:
+        return ""
+    started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    (exit_code, output) = exec_command(container_dir, executable, command,
+                                       topdir=topdir, capture=True)
+    previous = health_status(container_dir)
+    log = previous.get("Log")
+    if not isinstance(log, list):
+        log = []
+    log.append({
+        "Start": started,
+        "End": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "ExitCode": exit_code,
+        "Output": str(output)[:1000],
+    })
+    del log[:-5]
+    try:
+        streak = int(previous.get("FailingStreak") or 0)
+    except (TypeError, ValueError):
+        streak = 0
+    try:
+        retries = int(config.get("Retries") or 3)
+    except (TypeError, ValueError):
+        retries = 3
+    try:
+        start_period = float(config.get("StartPeriod") or 0)
+    except (TypeError, ValueError):
+        start_period = 0.0
+    state = read_state(container_dir)
+    started_epoch = _timestamp_epoch(state.get("timestamp"))
+    in_start_period = (start_period and started_epoch is not None and
+                       time.time() - started_epoch < start_period)
+    if in_start_period:
+        status = "starting"
+        streak = 0
+    elif exit_code == 0:
+        status = "healthy"
+        streak = 0
+    else:
+        streak += 1
+        status = "unhealthy" if streak >= retries else "starting"
+    health = {"Status": status, "FailingStreak": streak, "Log": log}
+    _write_json_file(os.path.join(container_dir, HEALTH_NAME), health)
+    return status
+
+
+def healthcheck_loop(container_dir, executable, topdir="", stop_event=None):
+    """Run healthchecks until the container stops or stop_event is set"""
+    config = health_config(container_dir)
+    if not _health_command(config.get("Test")):
+        return
+    try:
+        interval = float(config.get("Interval") or 30)
+    except (TypeError, ValueError):
+        interval = 30.0
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return
+        if read_state(container_dir).get("status") not in ("running",
+                                                          "paused"):
+            return
+        healthcheck_once(container_dir, executable, topdir)
+        deadline = time.time() + interval
+        while time.time() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                return
+            if read_state(container_dir).get("status") not in ("running",
+                                                              "paused"):
+                return
+            time.sleep(0.2)

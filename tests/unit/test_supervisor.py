@@ -194,5 +194,35 @@ class SupervisorTestCase(TestCase):
                 self.container_id, self.container_dir, ["run", "CID"]))
 
 
+    def test_13_healthcheck(self):
+        """Test13 healthcheck_once writes healthy/unhealthy status"""
+        import time
+        config = {"Test": ["CMD-SHELL", "true"], "Interval": 1,
+                  "Timeout": 1, "Retries": 2, "StartPeriod": 0}
+        supervisor.write_health_config(self.container_dir, config)
+        self._state({"status": "running", "pid": os.getpid(),
+                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                time.gmtime())})
+        with patch('udocker.supervisor.exec_command',
+                   return_value=(0, "ok")):
+            self.assertEqual(supervisor.healthcheck_once(
+                self.container_dir, "runc"), "healthy")
+        health = supervisor.health_status(self.container_dir)
+        self.assertEqual(health["Status"], "healthy")
+        self.assertEqual(len(health["Log"]), 1)
+        with patch('udocker.supervisor.exec_command',
+                   return_value=(1, "bad")):
+            supervisor.healthcheck_once(self.container_dir, "runc")
+            self.assertEqual(supervisor.health_status(
+                self.container_dir)["Status"], "starting")
+            supervisor.healthcheck_once(self.container_dir, "runc")
+        health = supervisor.health_status(self.container_dir)
+        self.assertEqual(health["Status"], "unhealthy")
+        self.assertEqual(health["FailingStreak"], 2)
+
+
+if __name__ == '__main__':
+    main()
+
 if __name__ == '__main__':
     main()

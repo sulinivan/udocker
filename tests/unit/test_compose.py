@@ -359,6 +359,11 @@ class ComposeProjectTestCase(TestCase):
             "    environment:\n"
             "      B: from-compose\n"
             "    restart: unless-stopped\n"
+            "    healthcheck:\n"
+            "      test: [\"CMD-SHELL\", \"test -f /ok\"]\n"
+            "      interval: 5s\n"
+            "      retries: 2\n"
+            "      start_period: 3s\n"
             "    stop_signal: SIGQUIT\n"
             "    stop_grace_period: 1m30s\n"
             "    networks: [backend]\n"
@@ -386,6 +391,11 @@ class ComposeProjectTestCase(TestCase):
         self.assertIn("B=from-compose", plan["environment"])
         self.assertEqual(plan["ulimits"], ["nofile=128", "nproc=16:32"])
         self.assertEqual(plan["restart"], "unless-stopped")
+        self.assertEqual(plan["healthcheck"]["test"],
+                         ["CMD-SHELL", "test -f /ok"])
+        self.assertEqual(plan["healthcheck"]["interval"], 5)
+        self.assertEqual(plan["healthcheck"]["retries"], 2)
+        self.assertEqual(plan["healthcheck"]["start_period"], 3)
         self.assertEqual(plan["stop_signal"], "SIGQUIT")
         self.assertEqual(plan["stop_timeout"], 90)
         self.assertNotIn("networks", errors.getvalue())
@@ -395,6 +405,10 @@ class ComposeProjectTestCase(TestCase):
         self.assertIn("--ulimit=nofile=128", args)
         self.assertIn("--ulimit=nproc=16:32", args)
         self.assertIn("--restart=unless-stopped", args)
+        self.assertIn("--health-cmd=test -f /ok", args)
+        self.assertIn("--health-interval=5s", args)
+        self.assertIn("--health-retries=2", args)
+        self.assertIn("--health-start-period=3s", args)
         self.assertIn("--stop-signal=SIGQUIT", args)
         self.assertIn("--stop-timeout=90", args)
 

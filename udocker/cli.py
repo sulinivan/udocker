@@ -11,6 +11,7 @@ import shutil
 import socket
 import time
 import calendar
+import threading
 from getpass import getpass
 
 from udocker import __version__
@@ -623,6 +624,86 @@ class UdockerCLI(object):
                 json.dump(list(volumes), filep)
         except (IOError, OSError, ValueError, TypeError):
             pass
+
+    @staticmethod
+    def _duration_seconds(value):
+        """Docker duration ('30s', '1m30s', bare seconds) to float seconds"""
+        if value in (None, False, ""):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip().lower()
+        try:
+            return float(text)
+        except ValueError:
+            pass
+        units = {"ns": 1e-9, "us": 1e-6, "ms": 1e-3,
+                 "s": 1.0, "m": 60.0, "h": 3600.0}
+        total = 0.0
+        index = 0
+        while index < len(text):
+            start = index
+            while index < len(text) and (text[index].isdigit() or
+                                         text[index] == "."):
+                index += 1
+            if start == index or index >= len(text) or text[index] not in units:
+                return None
+            total += float(text[start:index]) * units[text[index]]
+            index += 1
+        return total
+
+    @staticmethod
+    def _image_healthcheck(container_dir):
+        """Healthcheck mapping from the image metadata, empty when absent"""
+        if not isinstance(container_dir, (str, bytes)):
+            return {}
+        try:
+            with open(container_dir + "/container.json", "r") as filep:
+                data = json.load(filep)
+        except (IOError, OSError, ValueError, TypeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        meta = data.get("config") or data.get("container_config") or data
+        if not isinstance(meta, dict):
+            return {}
+        health = meta.get("Healthcheck")
+        return dict(health) if isinstance(health, dict) else {}
+
+    def _health_config(self, container_dir, opt):
+        """Merge image healthcheck metadata with the run --health-* flags"""
+        config = self._image_healthcheck(container_dir)
+        for key in ("Interval", "Timeout", "StartPeriod"):
+            if key in config:
+                try:
+                    config[key] = float(config[key]) / 1000000000.0
+                except (TypeError, ValueError):
+                    config.pop(key, None)
+        command = opt.get("healthcmd")
+        if command:
+            value = str(command)
+            if value.strip().upper() == "NONE":
+                return None
+            config["Test"] = ["CMD-SHELL", value]
+        for key, optkey in (("Interval", "healthinterval"),
+                            ("Timeout", "healthtimeout"),
+                            ("StartPeriod", "healthstartperiod")):
+            seconds = self._duration_seconds(opt.get(optkey))
+            if seconds is not None:
+                config[key] = seconds
+        retries = opt.get("healthretries")
+        if retries not in (None, False, ""):
+            try:
+                config["Retries"] = int(retries)
+            except (TypeError, ValueError):
+                return None
+        if not config.get("Test"):
+            return None
+        config.setdefault("Interval", 30.0)
+        config.setdefault("Timeout", 30.0)
+        config.setdefault("Retries", 3)
+        config.setdefault("StartPeriod", 0.0)
+        return config
 
     @staticmethod
     def _valid_restart_policy(policy):
@@ -1397,6 +1478,26 @@ class UdockerCLI(object):
                 "fl": ("--restart-monitor",), "act": 'R',
                 "p2": "CMD_OPT", "p3": False
             },
+            "healthcmd": {
+                "fl": ("--health-cmd=",), "act": 'R',
+                "p2": "CMD_OPT", "p3": False
+            },
+            "healthinterval": {
+                "fl": ("--health-interval=",), "act": 'R',
+                "p2": "CMD_OPT", "p3": False
+            },
+            "healthtimeout": {
+                "fl": ("--health-timeout=",), "act": 'R',
+                "p2": "CMD_OPT", "p3": False
+            },
+            "healthretries": {
+                "fl": ("--health-retries=",), "act": 'R',
+                "p2": "CMD_OPT", "p3": False
+            },
+            "healthstartperiod": {
+                "fl": ("--health-start-period=",), "act": 'R',
+                "p2": "CMD_OPT", "p3": False
+            },
             "nobanner": {
                 "fl": ("--nobanner",), "act": 'R',
                 "p2": "CMD_OPT", "p3": False
@@ -1475,6 +1576,11 @@ class UdockerCLI(object):
         --ulimit=<name=soft[:hard]>:set a resource limit (repeatable)
         --stop-signal=<signal>     :signal sent by stop (default image value)
         --stop-timeout=<seconds>   :seconds stop waits before killing
+        --health-cmd=<command>     :healthcheck command (NONE disables)
+        --health-interval=<time>   :healthcheck interval (default 30s)
+        --health-timeout=<time>    :healthcheck timeout (default 30s)
+        --health-retries=<n>       :failures before unhealthy (default 3)
+        --health-start-period=<t>  :grace period before failures count
 
         Only available in Rn execution modes:
         --device=/dev/xxx          :pass device to container (R1 mode only)
@@ -1580,6 +1686,9 @@ class UdockerCLI(object):
             opt.get("stopsignal") or self._image_stop_signal(container_dir)
             or "SIGTERM",
             opt.get("stoptimeout"))
+        health_config = self._health_config(container_dir, opt)
+        if health_config:
+            supervisor.write_health_config(container_dir, health_config)
         if not self._expand_publish_all(exec_engine, container_id):
             return self.STATUS_ERROR
         portsmap = opt.get("portsmap") or []
@@ -1596,6 +1705,14 @@ class UdockerCLI(object):
             Msg().err("Error: cannot publish container ports")
             return self.STATUS_ERROR
         self._write_state(container_dir, "running", ports=portsmap)
+        if health_config and self._is_runc_mode(container_id):
+            (dummy, health_executable) = self._runc_engine(container_id)
+            if health_executable:
+                threading.Thread(
+                    target=supervisor.healthcheck_loop,
+                    args=(container_dir, health_executable),
+                    kwargs={"topdir": Config.conf['topdir']},
+                    daemon=True).start()
         saved_limits = []
         if opt.get("ulimit"):
             try:
@@ -2597,6 +2714,12 @@ class UdockerCLI(object):
                     created_epoch = 0.0
             else:
                 created_epoch = 0.0
+            health = supervisor.health_status(container_dir)
+            health_state = str(health.get("Status") or "")
+            docker_status = _docker_status(container_dir, status)
+            if health_state in ("healthy", "unhealthy") and \
+                    status == "Running":
+                docker_status += " (%s)" % health_state
             containers.append({
                 "container_id": container_id,
                 "name": names,
@@ -2611,7 +2734,8 @@ class UdockerCLI(object):
                     self.localrepo,
                     container_id).get_container_platform_fmt(),
                 "status": status,
-                "docker_status": _docker_status(container_dir, status),
+                "docker_status": docker_status,
+                "health": health_state,
                 "command": _container_command(container_dir, no_trunc),
                 "created": (_human_duration(time.time() - created_epoch) +
                             " ago" if created_epoch else ""),
@@ -3440,24 +3564,28 @@ class UdockerCLI(object):
                         container_dir + "/container.json")))
             except (IOError, OSError, TypeError):
                 created = ""
+        docker_state = {
+            "Status": self._docker_state_name(status),
+            "Running": running,
+            "Paused": status == "Paused",
+            "Restarting": False,
+            "OOMKilled": False,
+            "Dead": False,
+            "Pid": pid,
+            "ExitCode": exit_code,
+            "Error": "",
+            "StartedAt": timestamps if running else "",
+            "FinishedAt": "" if running else timestamps,
+        }
+        health = supervisor.health_status(container_dir)
+        if health.get("Status"):
+            docker_state["Health"] = health
         return {
             "Id": container_id,
             "Created": created,
             "Path": argv[0] if argv else "",
             "Args": argv[1:] if argv else [],
-            "State": {
-                "Status": self._docker_state_name(status),
-                "Running": running,
-                "Paused": status == "Paused",
-                "Restarting": False,
-                "OOMKilled": False,
-                "Dead": False,
-                "Pid": pid,
-                "ExitCode": exit_code,
-                "Error": "",
-                "StartedAt": timestamps if running else "",
-                "FinishedAt": "" if running else timestamps,
-            },
+            "State": docker_state,
             "Image": image,
             "Name": name,
             "RestartCount": 0,
