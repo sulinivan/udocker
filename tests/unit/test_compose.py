@@ -74,11 +74,13 @@ class FakeProcess(object):
 class FakeUdocker(object):
     """Emulate the udocker child processes and record their arguments"""
 
-    def __init__(self, containers=None, logs=None, failing=()):
+    def __init__(self, containers=None, logs=None, failing=(),
+                 inspect_output="healthy"):
         self.calls = []
         self.containers = containers or []
         self.logs = logs or {}
         self.failing = tuple(failing)
+        self.inspect_output = inspect_output
 
     def __call__(self, argv, **kwargs):
         """Answer one child call"""
@@ -89,6 +91,8 @@ class FakeUdocker(object):
             text = json.dumps(self.containers)
         elif args and args[0] == "logs":
             text = self.logs.get(args[-1], "")
+        elif args and args[0] == "inspect":
+            text = self.inspect_output
         status = 0
         for marker in self.failing:
             if marker in " ".join(args):
@@ -359,6 +363,10 @@ class ComposeProjectTestCase(TestCase):
             "    environment:\n"
             "      B: from-compose\n"
             "    restart: unless-stopped\n"
+            "    ipc: host\n"
+            "    runtime: runc\n"
+            "    deploy:\n"
+            "      replicas: 2\n"
             "    healthcheck:\n"
             "      test: [\"CMD-SHELL\", \"test -f /ok\"]\n"
             "      interval: 5s\n"
@@ -399,6 +407,11 @@ class ComposeProjectTestCase(TestCase):
         self.assertEqual(plan["stop_signal"], "SIGQUIT")
         self.assertEqual(plan["stop_timeout"], 90)
         self.assertNotIn("networks", errors.getvalue())
+        self.assertNotIn("unsupported key ignored: ipc", errors.getvalue())
+        self.assertNotIn("unsupported key ignored: runtime",
+                         errors.getvalue())
+        self.assertNotIn("unsupported key ignored: deploy",
+                         errors.getvalue())
         args = compose.run_arguments(plan)
         self.assertIn("--env=A=file", args)
         self.assertIn("--env=B=from-compose", args)
@@ -732,6 +745,75 @@ class ComposeCommandTestCase(TestCase):
         self.assertEqual(status, 1)
         self.assertIn("no compose file found", errors.getvalue())
 
+
+    def test_20_depends_on_healthy(self):
+        """Test20 depends_on service_healthy waits before starting"""
+        text = (
+            "name: dep\n"
+            "services:\n"
+            "  db:\n"
+            "    image: busybox:latest\n"
+            "    healthcheck:\n"
+            "      test: [\"CMD-SHELL\", \"true\"]\n"
+            "    command: sleep 60\n"
+            "  web:\n"
+            "    image: busybox:latest\n"
+            "    depends_on:\n"
+            "      db:\n"
+            "        condition: service_healthy\n"
+            "    command: sleep 60\n"
+        )
+        path = write_compose(self.base, text, name="depends.yaml")
+        fake = FakeUdocker(inspect_output="healthy")
+        (status, out, errors, fake, cmdp) = self.run_compose(
+            ["up", "-d", "--file=" + path], fake)
+        self.assertEqual(status, 0)
+        self.assertIn("waiting for dep_db_1", out)
+        inspects = [call for call in fake.commands()
+                    if call and call[0] == "inspect"]
+        self.assertTrue(inspects)
+        self.assertEqual(inspects[0][1], "-f")
+        self.assertIn("State.Health.Status", inspects[0][2])
+
+    def test_21_depends_on_unhealthy(self):
+        """Test21 an unhealthy dependency aborts compose up"""
+        text = (
+            "name: dep\n"
+            "services:\n"
+            "  db:\n"
+            "    image: busybox:latest\n"
+            "    healthcheck:\n"
+            "      test: [\"CMD-SHELL\", \"true\"]\n"
+            "  web:\n"
+            "    image: busybox:latest\n"
+            "    depends_on:\n"
+            "      db:\n"
+            "        condition: service_healthy\n"
+        )
+        path = write_compose(self.base, text, name="depends.yaml")
+        fake = FakeUdocker(inspect_output="unhealthy")
+        (status, out, errors, fake, cmdp) = self.run_compose(
+            ["up", "-d", "--file=" + path], fake)
+        self.assertEqual(status, 1)
+        self.assertIn("not healthy", errors)
+
+    def test_22_up_wait(self):
+        """Test22 compose up --wait waits for healthy containers"""
+        text = (
+            "name: waitproj\n"
+            "services:\n"
+            "  app:\n"
+            "    image: busybox:latest\n"
+            "    healthcheck:\n"
+            "      test: [\"CMD-SHELL\", \"true\"]\n"
+            "    command: sleep 60\n"
+        )
+        path = write_compose(self.base, text, name="wait.yaml")
+        fake = FakeUdocker(inspect_output="healthy")
+        (status, out, errors, fake, cmdp) = self.run_compose(
+            ["up", "-d", "--wait", "--file=" + path], fake)
+        self.assertEqual(status, 0)
+        self.assertIn("project waitproj is up", out)
 
 if __name__ == '__main__':
     main()

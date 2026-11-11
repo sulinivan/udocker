@@ -34,7 +34,8 @@ SUPPORTED_KEYS = ("image", "build", "container_name", "command",
                   "volumes", "working_dir", "user", "labels", "depends_on",
                   "hostname", "extra_hosts", "ulimits", "networks",
                   "network_mode", "stop_signal", "stop_grace_period",
-                  "restart", "healthcheck")
+                  "restart", "healthcheck", "ipc", "pid", "runtime",
+                  "cgroup", "deploy")
 
 ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}"
                          r"|\$([A-Za-z_][A-Za-z0-9_]*)")
@@ -704,6 +705,18 @@ def parse_labels(value):
     return [str(value)]
 
 
+def parse_depends_conditions(value):
+    """Conditions of a long-syntax depends_on mapping, empty for the list"""
+    result = {}
+    if isinstance(value, dict):
+        for (name, spec) in value.items():
+            condition = "service_started"
+            if isinstance(spec, dict) and spec.get("condition"):
+                condition = str(spec["condition"])
+            result[str(name)] = condition
+    return result
+
+
 def parse_depends_on(value):
     """Normalize depends_on, short or long syntax, to service names"""
     if value is None:
@@ -784,6 +797,8 @@ def normalize_service(project, service, config, compose_dir,
         "restart": str(config.get("restart") or ""),
         "healthcheck": parse_healthcheck(config.get("healthcheck")),
         "depends_on": parse_depends_on(config.get("depends_on")),
+        "depends_conditions": parse_depends_conditions(
+            config.get("depends_on")),
     }
 
 
@@ -1192,7 +1207,7 @@ def parse_options(args, flags=(), values=()):
 FILE_OPTIONS = ("-f", "--file", "-p", "--project-name")
 PROJECT_OPTIONS = ("-p", "--project-name")
 UP_FLAGS = ("-d", "--detach", "--build", "--force-recreate",
-            "--remove-orphans")
+            "--remove-orphans", "--wait")
 
 
 def _load_project(options):
@@ -1217,6 +1232,40 @@ def _remove_orphans(project, index):
     for name in orphan_names(project, index):
         Msg().out("Info: removing orphan container: %s" % name, l=Msg.INF)
         _udocker(["rm", "-f", name])
+
+
+HEALTH_WAIT_TIMEOUT = 60
+
+
+def _inspect_field(name, template):
+    """Run udocker inspect -f and return the stripped output"""
+    (status, output) = _udocker(["inspect", "-f", template, name])
+    if status != 0:
+        return ""
+    return output.strip()
+
+
+def _wait_healthy(name, timeout=HEALTH_WAIT_TIMEOUT):
+    """Wait until a container reports healthy, False on unhealthy/timeout"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status = _inspect_field(name, "{{.State.Health.Status}}")
+        if status == "healthy":
+            return True
+        if status == "unhealthy":
+            return False
+        time.sleep(0.5)
+    return False
+
+
+def _wait_running(name, timeout=HEALTH_WAIT_TIMEOUT):
+    """Wait until a container is running (used by compose up --wait)"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _inspect_field(name, "{{.State.Status}}") == "running":
+            return True
+        time.sleep(0.5)
+    return False
 
 
 def _cmd_up(cli, args):
@@ -1247,6 +1296,17 @@ def _cmd_up(cli, args):
     started = []
     for service in order:
         plan = project.plan(service)
+        for dependency in plan.get("depends_on") or []:
+            if (plan.get("depends_conditions") or {}).get(dependency) != \
+                    "service_healthy":
+                continue
+            dependency_name = project.plan(dependency)["container_name"]
+            Msg().out("Info: waiting for %s to be healthy" % dependency_name,
+                      l=Msg.INF)
+            if not _wait_healthy(dependency_name):
+                Msg().err("Error: dependency is not healthy:",
+                          dependency_name)
+                return cli.STATUS_ERROR
         name = plan["container_name"]
         record = start.get(name)
         if record is not None and options.get("--force-recreate"):
@@ -1270,6 +1330,15 @@ def _cmd_up(cli, args):
             Msg().err("Error: cannot start container:", name)
             return cli.STATUS_ERROR
         started.append(name)
+    if options.get("--wait"):
+        for service in order:
+            plan = project.plan(service)
+            name = plan["container_name"]
+            healthy = bool((plan.get("healthcheck") or {}).get("test"))
+            ok = _wait_healthy(name) if healthy else _wait_running(name)
+            if not ok:
+                Msg().err("Error: container is not ready:", name)
+                return cli.STATUS_ERROR
     if options.get("-d") or options.get("--detach"):
         Msg().out("Info: project %s is up" % project.name, l=Msg.INF)
         return cli.STATUS_OK
@@ -1418,9 +1487,11 @@ def do_compose(cli, cmdp):
     -p, --project-name=<name>  :project name (default: directory name)
 
     Commands:
-      up [-d] [--build] [--force-recreate] [--remove-orphans] [services...]
+      up [-d] [--build] [--force-recreate] [--remove-orphans] [--wait]
+                                [services...]
                                 :create and start the services; without -d
-                                 follow the logs and stop on Ctrl-C
+                                 follow the logs and stop on Ctrl-C; --wait
+                                 waits for running/healthy
       down [--remove-orphans] [--rmi] [-v]
                                 :stop and delete the project containers;
                                  -v also removes the project named volumes
@@ -1441,8 +1512,10 @@ def do_compose(cli, cmdp):
     <project>_<name> unless the top-level volumes section sets name: or
     external: true), hostname/extra_hosts/labels, env_file, .env
     substitution, ulimits, stop_signal/stop_grace_period, restart policies
-    and healthcheck (executed in R execution modes); service networks and
-    network_mode are accepted (everything shares the host network).
+    and healthcheck (executed in R execution modes); depends_on
+    condition: service_healthy waits for the health status and --wait waits
+    for running/healthy. ipc, pid, runtime, cgroup and deploy sections are
+    accepted but not applied; networks/network_mode share the host stack.
     """
     consume = getattr(cmdp, "consume_all", None)
     if consume is not None:
