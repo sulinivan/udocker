@@ -22,6 +22,7 @@ COMPAT_GROUPS = {
         "stats": ["stats"], "port": ["port"], "diff": ["diff"],
         "wait": ["wait"], "commit": ["commit"], "cp": ["cp"],
         "rename": ["rename"], "pause": ["pause"],
+        "update": ["update"],
         "unpause": ["unpause"],
     },
     "image": {
@@ -179,6 +180,7 @@ class UMain(object):
             "prune": self.cli.do_prune, "compose": self.cli.do_compose,
             "volume": self.cli.do_volume, "info": self.cli.do_info,
             "network": self.cli.do_network, "events": self.cli.do_events,
+            "update": self.cli.do_update,
             "pause": self.cli.do_pause, "unpause": self.cli.do_unpause,
         }
 
@@ -201,6 +203,11 @@ class UMain(object):
             if command != "install":
                 self.cli.do_install(None)
             exit_status = cmds[command](self.cmdp)  # executes command
+            if command == "create" and exit_status == self.STATUS_ERROR:
+                exit_status = 125
+            elif (command == "run" and exit_status == self.STATUS_ERROR and
+                  not getattr(self.cli, "container_started", False)):
+                exit_status = 125
             if self.cmdp.missing_options():
                 Msg().err("Error: syntax error at: %s" %
                           " ".join(self.cmdp.missing_options()))

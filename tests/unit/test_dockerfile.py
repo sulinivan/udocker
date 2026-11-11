@@ -6,6 +6,7 @@ udocker unit tests: DockerfileParser and ContainerBuilder
 
 import os
 import io
+import hashlib
 import shutil
 import tarfile
 import tempfile
@@ -533,6 +534,70 @@ class ContainerBuilderTestCase(TestCase):
         finally:
             shutil.rmtree(tmpdir)
 
+
+    def test_38_metadata_instructions(self):
+        """Test38 STOPSIGNAL, HEALTHCHECK and ONBUILD metadata."""
+        builder = self._builder()
+        self.assertTrue(builder._do_stopsignal("SIGQUIT"))
+        self.assertEqual(builder.config["StopSignal"], "SIGQUIT")
+        self.assertTrue(builder._do_onbuild("RUN echo hi"))
+        self.assertEqual(builder.config["OnBuild"], ["RUN echo hi"])
+        self.assertTrue(builder._do_healthcheck(
+            "--interval=30s --timeout=5s --retries=3 CMD curl -f http://x"))
+        health = builder.config["Healthcheck"]
+        self.assertEqual(health["Test"], ["CMD-SHELL", "curl -f http://x"])
+        self.assertEqual(health["Interval"], 30000000000)
+        self.assertEqual(health["Timeout"], 5000000000)
+        self.assertEqual(health["Retries"], 3)
+        self.assertTrue(builder._do_healthcheck("NONE"))
+        self.assertEqual(builder.config["Healthcheck"]["Test"], ["NONE"])
+        self.assertFalse(builder._do_healthcheck("--bogus=1 CMD true"))
+        self.assertFalse(builder._do_stopsignal(""))
+        self.assertFalse(builder._do_onbuild(""))
+
+    def test_39_add_url(self):
+        """Test39 ADD downloads a remote URL and verifies the checksum."""
+        tmpdir = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(tmpdir, "ROOT"))
+            self.mock_lrepo.cd_container.return_value = tmpdir
+            builder = self._builder()
+            payload = b"remote payload"
+
+            class Response(io.BytesIO):
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+            with patch(
+                    'udocker.container.dockerfile.urllib.request.urlopen',
+                    return_value=Response(payload)):
+                self.assertTrue(builder._do_add(
+                    "http://127.0.0.1:1/payload.txt /data/payload.txt"))
+            target = os.path.join(tmpdir, "ROOT", "data", "payload.txt")
+            with open(target, "rb") as filep:
+                self.assertEqual(filep.read(), payload)
+            checksum = hashlib.sha256(payload).hexdigest()
+            with patch(
+                    'udocker.container.dockerfile.urllib.request.urlopen',
+                    return_value=Response(payload)):
+                self.assertTrue(builder._do_add(
+                    "--checksum=sha256:%s http://127.0.0.1:1/p2.txt /p2.txt"
+                    % checksum))
+            with patch(
+                    'udocker.container.dockerfile.urllib.request.urlopen',
+                    return_value=Response(payload)):
+                self.assertFalse(builder._do_add(
+                    "--checksum=sha256:%s http://127.0.0.1:1/p3.txt /p3.txt"
+                    % ("0" * 64)))
+            self.assertFalse(os.path.exists(
+                os.path.join(tmpdir, "ROOT", "p3.txt")))
+            self.assertFalse(builder._do_copy(
+                "http://127.0.0.1:1/payload.txt /copy.txt"))
+        finally:
+            shutil.rmtree(tmpdir)
 
 if __name__ == '__main__':
     main()

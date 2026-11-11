@@ -276,9 +276,11 @@ class UdockerCLI(object):
 
     STATUS_OK = 0
     STATUS_ERROR = 1
+    STATUS_USAGE = 125
 
     def __init__(self, localrepo):
         self.localrepo = localrepo
+        self.container_started = False
         self.dockerioapi = DockerIoAPI(self.localrepo)
         self.localfileapi = LocalFileAPI(self.localrepo)
         if Config.conf['keystore'].startswith("/"):
@@ -1490,6 +1492,7 @@ class UdockerCLI(object):
         Using run --name=<container-name> --pull=reuse allows to use existing
         container and only pull/create if the <container-name> does not exist.
         """
+        self.container_started = False
         self._get_run_options(cmdp)
         detach = cmdp.get("-d") or cmdp.get("--detach")
         container_or_image = cmdp.get("P1")
@@ -1539,6 +1542,10 @@ class UdockerCLI(object):
                         Msg().err("Error: invalid container name")
                         return self.STATUS_ERROR
 
+        if not container_id and not Config.conf['location']:
+            Msg().err("Error: image or container not found:",
+                      container_or_image)
+            return self.STATUS_ERROR
         exec_mode = ExecutionMode(self.localrepo, container_id)
         exec_engine = exec_mode.get_engine()
         if not exec_engine:
@@ -1597,6 +1604,7 @@ class UdockerCLI(object):
             except ValueError as error:
                 Msg().err("Error: invalid --ulimit:", str(error))
                 return self.STATUS_ERROR
+        self.container_started = True
         try:
             exit_status = exec_engine.run(container_id)
         except BaseException:
@@ -3939,6 +3947,18 @@ class UdockerCLI(object):
         except KeyboardInterrupt:
             return self.STATUS_OK
 
+    def do_update(self, cmdp):
+        """
+        update: change container resource limits
+        Not available without root: cgroup delegation is absent.
+        """
+        cmdp.get("P1")
+        if cmdp.missing_options():
+            return self.STATUS_ERROR
+        Msg().err("Error: update requires cgroup delegation and is not"
+                  " available without root/daemon")
+        return self.STATUS_ERROR
+
     def do_help(self, cmdp):
         """
         Print help information
@@ -3982,6 +4002,7 @@ Docker-style command groups are accepted and translated:
   stop <container>              :Stop a running container
   restart <container>           :Stop and start a container
   events [--since=] [--until=]:Stream container events as JSON
+  update <container>            :not available without root (cgroups)
   pause <container>             :Pause all processes of a container
   unpause <container>           :Resume a paused container
   kill -s <signal> <container>  :Send a signal to a running container

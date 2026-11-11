@@ -6,9 +6,15 @@ import re
 import glob
 import json
 import shlex
+import shutil
+import ssl
 import tarfile
 import time
+import hashlib
+import urllib.parse
+import urllib.request
 
+from udocker.config import Config
 from udocker.msg import Msg
 from udocker.helper.hostinfo import HostInfo
 from udocker.helper.unique import Unique
@@ -102,10 +108,12 @@ class ContainerBuilder(object):
     container previously created from the FROM image, and optionally
     commits the result as a new image in the local repository.
 
-    Limitations: ADD does not fetch remote URLs, RUN executes using the
-    execution mode currently configured for the container, and commit()
-    packs the whole container filesystem into a single layer (docker
-    produces diff layers, so images grow with each build).
+    Limitations: ADD downloads remote URLs but does not unpack remote
+    archives, HEALTHCHECK metadata is stored but not executed (there is no
+    daemon), RUN executes using the execution mode currently configured for
+    the container, and commit() packs the whole container filesystem into a
+    single layer (docker produces diff layers, so images grow with each
+    build).
     """
 
     SHELL_CMD = ["/bin/sh", "-c"]
@@ -381,6 +389,86 @@ class ContainerBuilder(object):
         self.config["Labels"] = labels
         return True
 
+    def _do_stopsignal(self, arg):
+        signal = arg.strip()
+        if not signal:
+            Msg().err("Error: STOPSIGNAL requires a signal")
+            return False
+        self.config["StopSignal"] = signal
+        return True
+
+    def _do_onbuild(self, arg):
+        trigger = arg.strip()
+        if not trigger:
+            Msg().err("Error: ONBUILD requires an instruction")
+            return False
+        onbuild = self.config.get("OnBuild")
+        if not isinstance(onbuild, list):
+            onbuild = []
+        onbuild.append(trigger)
+        self.config["OnBuild"] = onbuild
+        return True
+
+    @staticmethod
+    def _duration_ns(text):
+        """Docker duration (30s, 1m30s) to nanoseconds"""
+        if isinstance(text, (int, float)):
+            return int(text)
+        value = str(text or "").strip().lower()
+        units = {"ns": 1, "us": 1000, "ms": 1000000,
+                 "s": 1000000000, "m": 60000000000,
+                 "h": 3600000000000}
+        match = re.match(r"^(\d+(?:\.\d+)?)(ns|us|ms|s|m|h)$", value)
+        if not match:
+            return 0
+        return int(float(match.group(1)) * units[match.group(2)])
+
+    def _do_healthcheck(self, arg):
+        text = arg.strip()
+        if not text:
+            Msg().err("Error: HEALTHCHECK requires an argument")
+            return False
+        if text.upper() == "NONE":
+            self.config["Healthcheck"] = {"Test": ["NONE"]}
+            return True
+        match = re.search(r"(?i)(?:^|\s)CMD\s", text)
+        if not match:
+            Msg().err("Error: HEALTHCHECK expects CMD or NONE:", text)
+            return False
+        options = {"Interval": 0, "Timeout": 0, "StartPeriod": 0,
+                   "Retries": 0}
+        names = {"interval": "Interval", "timeout": "Timeout",
+                 "start-period": "StartPeriod", "retries": "Retries"}
+        for token in text[:match.start()].split():
+            found = re.match(
+                r"^--(interval|timeout|start-period|retries)=(.+)$", token)
+            if not found:
+                Msg().err("Error: invalid HEALTHCHECK option:", token)
+                return False
+            key = names[found.group(1)]
+            if key == "Retries":
+                try:
+                    options[key] = int(found.group(2))
+                except ValueError:
+                    Msg().err("Error: invalid HEALTHCHECK retries:",
+                              found.group(2))
+                    return False
+            else:
+                options[key] = self._duration_ns(found.group(2))
+                if not options[key]:
+                    Msg().err("Error: invalid HEALTHCHECK duration:",
+                              found.group(2))
+                    return False
+        command = text[match.end():].strip()
+        if not command:
+            Msg().err("Error: HEALTHCHECK CMD requires a command")
+            return False
+        (is_exec, cmd) = self._parse_cmd_form(command)
+        options["Test"] = (["CMD"] + cmd if is_exec
+                           else ["CMD-SHELL", command])
+        self.config["Healthcheck"] = options
+        return True
+
     def _do_expose(self, arg):
         exposed = dict(self.config.get("ExposedPorts") or {})
         for port in arg.split():
@@ -587,6 +675,7 @@ class ContainerBuilder(object):
         from_stage = None
         chown = None
         chmod = None
+        checksum = None
         unpack = True
         plain_tokens = []
         for tok in tokens:
@@ -597,8 +686,7 @@ class ContainerBuilder(object):
             elif tok.startswith("--chmod="):
                 chmod = tok.split("=", 1)[1]
             elif tok.startswith("--checksum="):
-                Msg().out("Warning: --checksum only applies to remote "
-                          "sources, ignored:", tok, l=Msg.WAR)
+                checksum = tok.split("=", 1)[1]
             elif tok.startswith("--link"):
                 Msg().out("Warning: --link is not supported, ignored:",
                           tok, l=Msg.WAR)
@@ -642,9 +730,14 @@ class ContainerBuilder(object):
 
         for src in sources:
             if from_stage is None and re.match(r'^https?://', src):
-                Msg().err("Error: fetching remote sources is not supported:",
-                          src)
-                return False
+                if not allow_extract:
+                    Msg().err("Error: COPY does not support remote sources:",
+                              src)
+                    return False
+                if not self._fetch_url(src, dest_path, dest_is_dir, chown,
+                                       chmod, checksum):
+                    return False
+                continue
             matches = glob.glob(os.path.join(src_root, src.lstrip("/")))
             if not matches:
                 Msg().err("Error: COPY/ADD source not found:", src)
@@ -659,6 +752,55 @@ class ContainerBuilder(object):
                                       chown, chmod):
                     return False
         return True
+
+    def _fetch_url(self, url, dest_path, dest_is_dir, chown, chmod,
+                   checksum=None):
+        """ADD from an HTTP(S) URL: download the file, no unpacking"""
+        parsed = urllib.parse.urlparse(url)
+        name = os.path.basename(parsed.path) or "download"
+        target = os.path.join(dest_path, name) if dest_is_dir else dest_path
+        self._ensure_dir(os.path.dirname(target))
+        try:
+            request = urllib.request.Request(
+                url, headers={"User-Agent": "udocker"})
+            context = ssl._create_unverified_context() \
+                if Config.conf.get("http_insecure") else None
+            timeout = Config.conf.get("download_timeout") or 300
+            with urllib.request.urlopen(request, timeout=timeout,
+                                        context=context) as response:
+                with open(target, "wb") as outfile:
+                    shutil.copyfileobj(response, outfile)
+            os.chmod(target, 0o644)
+        except (IOError, OSError, ValueError, ssl.SSLError) as error:
+            Msg().err("Error: cannot fetch remote source", url, ":", error)
+            return False
+        if checksum and not self._verify_checksum(target, checksum):
+            Msg().err("Error: checksum mismatch for", url)
+            try:
+                os.remove(target)
+            except OSError:
+                pass
+            return False
+        if chown and not self._apply_chown(target, chown):
+            return False
+        if chmod and not self._apply_chmod(target, chmod):
+            return False
+        return True
+
+    @staticmethod
+    def _verify_checksum(path, checksum):
+        """Verify sha256/sha512 checksum of a downloaded file"""
+        (algorithm, separator, expected) = str(checksum).partition(":")
+        if not separator:
+            return False
+        try:
+            digest = hashlib.new(algorithm)
+            with open(path, "rb") as filep:
+                for chunk in iter(lambda: filep.read(65536), b""):
+                    digest.update(chunk)
+        except (IOError, OSError, ValueError):
+            return False
+        return digest.hexdigest().lower() == expected.lower()
 
     def _do_copy(self, arg):
         return self._copy_or_add(arg, allow_extract=False)
