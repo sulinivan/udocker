@@ -725,15 +725,16 @@ class ComposeCommandTestCase(TestCase):
         self.assertIn("cannot create container", errors)
 
     def test_24_compose_file_preference(self):
-        """Test24 udocker-compose files win over docker-compose ones"""
+        """Test24 the search order is the docker compose v2 one"""
+        self.assertEqual(compose.COMPOSE_FILES,
+                         ("compose.yaml", "compose.yml",
+                          "docker-compose.yml", "docker-compose.yaml"))
         directory = os.path.join(self.base, "pref")
         os.makedirs(directory)
-        write_compose(directory, "services:\n  web:\n    image: busybox\n",
-                      name="docker-compose.yml")
-        udocker_path = write_compose(
+        docker_path = write_compose(
             directory, "services:\n  web:\n    image: busybox\n",
-            name="udocker-compose.yml")
-        self.assertEqual(compose.find_compose_file(directory), udocker_path)
+            name="docker-compose.yml")
+        self.assertEqual(compose.find_compose_file(directory), docker_path)
         canonical = write_compose(directory)
         self.assertEqual(compose.find_compose_file(directory), canonical)
 
