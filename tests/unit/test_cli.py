@@ -968,7 +968,8 @@ class UdockerCLITestCase(TestCase):
         udoc = UdockerCLI(self.local)
         status = udoc.do_rmi(cmdp)
         self.assertEqual(status, 1)
-        self.assertTrue(mock_chkimg.called)
+        # docker behaviour: no arguments is a usage error, no image lookup
+        self.assertFalse(mock_chkimg.called)
         self.assertFalse(self.local.isprotected_imagerepo.called)
 
         argv = ["udocker", "rmi", "ipyrad"]
