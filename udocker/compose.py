@@ -29,7 +29,10 @@ from udocker.msg import Msg
 from udocker.utils.gotemplate import render as render_template
 from udocker.utils.gotemplate import render_table
 
+# udocker specific names come before the docker ones so that a project can
+# ship both files: "udocker compose up" then runs the rootless variant
 COMPOSE_FILES = ("compose.yaml", "compose.yml",
+                 "udocker-compose.yaml", "udocker-compose.yml",
                  "docker-compose.yml", "docker-compose.yaml")
 
 SUPPORTED_KEYS = ("image", "build", "container_name", "command",
@@ -3058,7 +3061,8 @@ def do_compose(cli, cmdp):
     compose: run a multi-container project described by a compose file
     compose [globals] <command> [options] [services...]
     -f, --file=<file>          :compose file, repeatable (default: compose.yaml,
-                                compose.yml, docker-compose.yml or .yaml)
+                                compose.yml, udocker-compose.yml/..yaml,
+                                docker-compose.yml or .yaml)
     -p, --project-name=<name>  :project name (default: name field or directory)
     --project-directory=<dir>  :base directory for relative paths
     --env-file=<file>          :environment file used for interpolation
