@@ -129,3 +129,9 @@ udocker/udocker
 /replica/
 /CONTINUITY.md
 /state.json
+
+# Parity measurement scaffolding (generated, not part of the runtime)
+/docs/docker-cli-*
+/docs/docker-compose-*
+/utils/docker_*_probe.py
+/utils/docker_cli_census.py
