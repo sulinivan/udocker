@@ -157,17 +157,26 @@ class UMain(object):
             Config.conf['http_insecure'] = True
 
         topdir = self.cmdp.get("--repo=", "GEN_OPT")
+        repo_given = bool(topdir)
         if topdir:  # override repo root tree
+            topdir = os.path.expandvars(os.path.expanduser(topdir))
             Config.conf['topdir'] = topdir
         self.local = LocalRepository()
         if not self.local.is_repo():
-            if topdir:
+            topdir = Config.conf['topdir']
+            occupied = []
+            if repo_given and os.path.isdir(topdir):
+                try:
+                    occupied = os.listdir(topdir)
+                except OSError:
+                    occupied = []
+            if occupied:  # an existing directory that is not a repository
                 Msg().err("Error: invalid udocker repository:", topdir)
                 sys.exit(self.STATUS_ERROR)
-            else:
-                Msg().out("Info: creating repo: " + Config.conf['topdir'],
-                          l=Msg.INF)
-                self.local.create_repo()
+            Msg().out("Info: creating repo: " + topdir, l=Msg.INF)
+            if not self.local.create_repo():
+                Msg().err("Error: cannot create udocker repository:", topdir)
+                sys.exit(self.STATUS_ERROR)
 
         self.cli = UdockerCLI(self.local)
 

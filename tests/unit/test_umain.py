@@ -100,6 +100,60 @@ class UMainTestCase(TestCase):
         umain = UMain(argv)
         status = umain.execute()
         self.assertEqual(status, 1)
+    @patch('udocker.umain.Msg')
+    @patch('udocker.umain.UdockerCLI')
+    @patch('udocker.umain.LocalRepository')
+    @patch('udocker.umain.os.geteuid')
+    def test_04_repo_path_expanded_and_created(self, mock_getuid,
+                                               mock_local, mock_ucli,
+                                               mock_msg):
+        """Test04 --repo with ~ is expanded and a missing repo is created."""
+        mock_msg.level = 0
+        mock_getuid.return_value = 1000
+        mock_local.return_value.is_repo.return_value = False
+        mock_local.return_value.create_repo.return_value = True
+        with patch('udocker.umain.os.path.isdir', return_value=False), \
+                patch('udocker.umain.os.path.expanduser',
+                      side_effect=lambda p: p.replace("~", "/home/u")):
+            umain = UMain(["udocker", "--repo=~/repos/x", "images"])
+            umain._prepare_exec()
+        self.assertEqual(Config.conf['topdir'], "/home/u/repos/x")
+        self.assertTrue(mock_local.return_value.create_repo.called)
+        self.assertTrue(mock_ucli.called)
+
+    @patch('udocker.umain.Msg')
+    @patch('udocker.umain.UdockerCLI')
+    @patch('udocker.umain.LocalRepository')
+    @patch('udocker.umain.os.geteuid')
+    def test_05_repo_populated_is_rejected(self, mock_getuid, mock_local,
+                                           mock_ucli, mock_msg):
+        """Test05 an existing non-repository directory is not taken over."""
+        mock_msg.level = 0
+        mock_getuid.return_value = 1000
+        mock_local.return_value.is_repo.return_value = False
+        with patch('udocker.umain.os.path.isdir', return_value=True), \
+                patch('udocker.umain.os.listdir', return_value=["data"]):
+            umain = UMain(["udocker", "--repo=/data/myrepo", "images"])
+            with self.assertRaises(SystemExit):
+                umain._prepare_exec()
+        self.assertFalse(mock_local.return_value.create_repo.called)
+
+    @patch('udocker.umain.Msg')
+    @patch('udocker.umain.UdockerCLI')
+    @patch('udocker.umain.LocalRepository')
+    @patch('udocker.umain.os.geteuid')
+    def test_06_repo_create_failure(self, mock_getuid, mock_local,
+                                    mock_ucli, mock_msg):
+        """Test06 a repository that cannot be created is a hard error."""
+        mock_msg.level = 0
+        mock_getuid.return_value = 1000
+        mock_local.return_value.is_repo.return_value = False
+        mock_local.return_value.create_repo.return_value = False
+        with patch('udocker.umain.os.path.isdir', return_value=False):
+            umain = UMain(["udocker", "--repo=/ro/repo", "images"])
+            with self.assertRaises(SystemExit):
+                umain._prepare_exec()
+        self.assertFalse(mock_ucli.called)
 
 
 if __name__ == '__main__':
