@@ -3,6 +3,7 @@
 
 import os
 import sys
+from udocker import compat
 from udocker.msg import Msg
 from udocker.cmdparser import CmdParser
 from udocker.config import Config
@@ -21,6 +22,7 @@ COMPAT_GROUPS = {
         "logs": ["logs"], "inspect": ["inspect"], "top": ["top"],
         "stats": ["stats"], "port": ["port"], "diff": ["diff"],
         "wait": ["wait"], "commit": ["commit"], "cp": ["cp"],
+        "export": ["export"], "attach": ["attach"],
         "rename": ["rename"], "pause": ["pause"],
         "update": ["update"], "prune": ["container-prune"],
         "unpause": ["unpause"],
@@ -36,10 +38,31 @@ COMPAT_GROUPS = {
     },
     "system": {
         "df": ["system", "df"], "prune": ["system", "prune"],
-        "info": ["info"],
+        "info": ["info"], "events": ["events"],
     },
 }
 
+
+# docker commands that only exist with a daemon/swarm, and the commands that
+# need a pty relay udocker does not have.  They fail with an explicit message
+# instead of the generic "invalid command".
+DAEMON_ONLY = {
+    "swarm": "the swarm manager needs a Docker daemon",
+    "service": "swarm services need a Docker daemon",
+    "stack": "swarm stacks need a Docker daemon",
+    "secret": "swarm secrets need a Docker daemon",
+    "config": "swarm configs need a Docker daemon",
+    "node": "swarm nodes need a Docker daemon",
+    "context": "docker contexts need a Docker daemon",
+    "plugin": "docker plugins need a daemon and root",
+    "checkpoint": "checkpointing needs CRIU and root",
+    "builder": "buildx builders need a Docker daemon",
+}
+
+NOT_ROOTLESS = {
+    "attach": "attaching to the container stdio needs a pty relay;"
+              " use: exec -it <container> <command>",
+}
 
 # short options that are always boolean, safe to split out of a combined
 # group such as -aq or -it
@@ -150,6 +173,14 @@ class UMain(object):
 
     def execute(self):
         """Command parsing and selection"""
+        if "--help" not in self.argv:
+            self.argv, refusal, page = compat.rewrite(self.argv)
+            if refusal:
+                Msg().err("Error:", refusal)
+                if page in ("run", "create", "container run",
+                            "container create"):
+                    return 125
+                return self.STATUS_ERROR
         self.argv = expand_short_flags(expand_compat_argv(self.argv))
         self._prepare_exec()
         cmds = {
@@ -217,5 +248,13 @@ class UMain(object):
 
             return exit_status
 
+        if command in NOT_ROOTLESS:
+            Msg().err("Error:", command, "is not available rootless:",
+                      NOT_ROOTLESS[command])
+            return self.STATUS_ERROR
+        if command in DAEMON_ONLY:
+            Msg().err("Error:", command, "is not available rootless:",
+                      DAEMON_ONLY[command])
+            return self.STATUS_ERROR
         Msg().err("Error: invalid command:", command, "\n")
         return self.STATUS_ERROR

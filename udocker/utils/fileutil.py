@@ -286,12 +286,22 @@ class FileUtil(object):
             verbose = 'v'
 
         cmd = ["tar", "-C", sourcedir, "-c" + verbose, "--one-file-system",
-               "-S", "--xattrs", "-f", tarfile, "."]
+               "-S", "--xattrs", "--ignore-failed-read", "-f", tarfile, "."]
         status = Uprocess().call(cmd, stderr=Msg.chlderr, close_fds=True)
-        if status:
-            Msg().err("Error: creating tar file:", tarfile)
-
-        return not status
+        if not status:
+            return True
+        # a running container has /proc and bind mounted files that tar
+        # cannot read: the archive is still complete enough, warn and keep it
+        try:
+            written = os.path.getsize(tarfile) > 0
+        except (OSError, TypeError):
+            written = False
+        if written:
+            Msg().out("Warning: some files could not be read while exporting,"
+                      " the archive is usable:", tarfile, l=Msg.WAR)
+            return True
+        Msg().err("Error: creating tar file:", tarfile)
+        return False
 
     def copydir(self, destdir, sourcedir=None):
         """Copy directories"""

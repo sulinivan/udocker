@@ -321,10 +321,10 @@ class ContainerStructure(object):
             Msg().err("Error: container not found:", self.container_id)
             return False
 
-        status = FileUtil(cont_dir + "/ROOT").tar(clone_file)
-        if not status:
+        if not FileUtil(cont_dir + "/ROOT").tar(clone_file):
             Msg().err("Error: exporting container file system:",
                       self.container_id)
+            return False
 
         return self.container_id
 
@@ -337,9 +337,9 @@ class ContainerStructure(object):
             Msg().err("Error: container not found:", self.container_id)
             return False
 
-        status = FileUtil(container_dir).tar(clone_file)
-        if not status:
+        if not FileUtil(container_dir).tar(clone_file):
             Msg().err("Error: export container as clone:", self.container_id)
+            return False
 
         return self.container_id
 

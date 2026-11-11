@@ -7,6 +7,7 @@ helpers (parsers, formatters, selectors) are kept apart so that the
 unit tests can feed fixtures instead of real /proc or real containers.
 """
 
+import json
 import os
 import sys
 import time
@@ -15,6 +16,7 @@ import posixpath
 
 from udocker.msg import Msg
 from udocker import supervisor
+from udocker.utils.gotemplate import render as render_template
 
 
 STATUS_OK = 0
@@ -360,7 +362,7 @@ def container_names(container_dir):
     return ",".join(sorted(names))
 
 
-def print_stats(containers):
+def print_stats(containers, output_format="", no_trunc=False):
     """Print one resource snapshot for all containers"""
     entries = []
     for item in containers or []:
@@ -393,8 +395,7 @@ def print_stats(containers):
     second = scan_procs()
     elapsed = time.time() - started
 
-    Msg().out(STATS_FMT % ("CONTAINER ID", "NAME", "CPU%",
-                           "MEM USAGE / LIMIT", "MEM%", "PIDS"))
+    records = []
     for (container_id, container_dir, pid) in roots:
         pids = proc_tree(second, pid) if pid else []
         if pids:
@@ -410,9 +411,32 @@ def print_stats(containers):
         mem_percent = (usage * 100.0 / limit) if limit else 0.0
         mem_column = "%s / %s" % (format_size(usage), format_size(limit))
         name = container_names(container_dir) or "-"
-        Msg().out(STATS_FMT % (str(container_id)[:12], name,
-                               "%.2f%%" % cpu, mem_column,
-                               "%.2f%%" % mem_percent, str(count)))
+        records.append((str(container_id)[:12] if not no_trunc
+                        else str(container_id), name, "%.2f%%" % cpu,
+                        mem_column, "%.2f%%" % mem_percent, str(count)))
+    return print_stats_records(records, output_format)
+
+
+def print_stats_records(records, output_format=""):
+    """Print the stats rows as a docker table, JSON or a Go template"""
+    if output_format == "json":
+        for row in records:
+            Msg().out(json.dumps({
+                "Container": row[0], "Name": row[1], "CPUPerc": row[2],
+                "MemUsage": row[3], "MemPerc": row[4], "PIDs": row[5],
+            }, sort_keys=True))
+        return STATUS_OK
+    if output_format and output_format != "table":
+        for row in records:
+            Msg().out(render_template(output_format, {
+                "Container": row[0], "Name": row[1], "CPUPerc": row[2],
+                "MemUsage": row[3], "MemPerc": row[4], "PIDs": row[5],
+            }))
+        return STATUS_OK
+    Msg().out(STATS_FMT % ("CONTAINER ID", "NAME", "CPU%",
+                           "MEM USAGE / LIMIT", "MEM%", "PIDS"))
+    for row in records:
+        Msg().out(STATS_FMT % row)
     return STATUS_OK
 
 
@@ -695,7 +719,7 @@ def _reclaimable(size, total):
     return "%s (%d%%)" % (format_size(size), percent)
 
 
-def print_system_df(localrepo):
+def print_system_df(localrepo, output_format=""):
     """Print disk usage of images and containers like docker system df"""
     tags = localrepo.get_imagerepos()
     used = used_images(localrepo)
@@ -749,17 +773,31 @@ def print_system_df(localrepo):
         else:
             volumes_reclaim += size
 
+    report = [
+        ("Images", len(tags), images_active, images_size, images_reclaim),
+        ("Containers", len(containers), containers_active, containers_size,
+         containers_reclaim),
+        ("Local Volumes", len(volumes), volumes_active, volumes_size,
+         volumes_reclaim),
+        ("Build Cache", 0, 0, 0, 0),
+    ]
+    if output_format == "json":
+        payload = {}
+        for row in report:
+            payload[row[0].replace(" ", "")] = {
+                "TotalCount": row[1], "Active": row[2],
+                "Size": format_size(row[3]), "Reclaimable": row[4],
+            }
+        Msg().out(json.dumps(payload, sort_keys=True))
+        return STATUS_OK
     Msg().out(DF_FMT % ("TYPE", "TOTAL", "ACTIVE", "SIZE", "RECLAIMABLE"))
-    Msg().out(DF_FMT % ("Images", str(len(tags)), str(images_active),
-                        format_size(images_size),
-                        _reclaimable(images_reclaim, images_size)))
-    Msg().out(DF_FMT % ("Containers", str(len(containers)),
-                        str(containers_active), format_size(containers_size),
-                        _reclaimable(containers_reclaim, containers_size)))
-    Msg().out(DF_FMT % ("Local Volumes", str(len(volumes)),
-                        str(volumes_active), format_size(volumes_size),
-                        _reclaimable(volumes_reclaim, volumes_size)))
-    Msg().out(DF_FMT % ("Build Cache", "0", "0", "0B", "0B"))
+    for row in report:
+        if row[0] == "Build Cache":
+            Msg().out(DF_FMT % ("Build Cache", "0", "0", "0B", "0B"))
+            continue
+        Msg().out(DF_FMT % (row[0], str(row[1]), str(row[2]),
+                            format_size(row[3]),
+                            _reclaimable(row[4], row[3])))
     return STATUS_OK
 
 

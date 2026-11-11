@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """udocker Command Line Interface implementation"""
 
+import fnmatch
 import os
+import subprocess
 import sys
 import string
 import json
@@ -270,6 +272,14 @@ def _filter_match(container, filters):
     return True
 
 
+class _RunOptions(object):
+    """Stand-in for an execution engine when only option values are needed
+    (create records the run options before any engine exists)."""
+
+    def __init__(self):
+        self.opt = {}
+
+
 class UdockerCLI(object):
     """Implements most of the command line interface.
     These methods correspond directly to the commands that can
@@ -291,6 +301,22 @@ class UdockerCLI(object):
             self.keystore = KeyStore(self.localrepo.homedir + "/" + Config.conf['keystore'])
 
         Msg().out("Debug: Localrepo homedir is", self.localrepo.homedir, l=Msg.DBG)
+
+    @staticmethod
+    def _argv_option(name):
+        """Value of a docker option given after a subcommand.
+
+        CmdParser stops scanning at the first positional argument on purpose,
+        so options such as `system df --format json` have to be read from the
+        raw command line.
+        """
+        args = list(sys.argv)
+        for index, token in enumerate(args):
+            if token.startswith(name + "="):
+                return token.split("=", 1)[1]
+            if token == name and index + 1 < len(args):
+                return args[index + 1]
+        return ""
 
     def _cdrepo(self, cmdp):
         """Select the top directory of a local repository"""
@@ -563,7 +589,9 @@ class UdockerCLI(object):
         if container_json:
             exposed = container_structure.get_container_meta(
                 "ExposedPorts", [], container_json)
-        for port in exposed or []:
+        exposed = list(exposed or [])
+        exposed.extend(exec_engine.opt.get("expose") or [])
+        for port in exposed:
             # metadata dicts are flattened to "key:value" strings by
             # ContainerStructure, so "8080/tcp:{}" -> port "8080/tcp"
             port_str = str(port).split(":", 1)[0]
@@ -672,6 +700,8 @@ class UdockerCLI(object):
 
     def _health_config(self, container_dir, opt):
         """Merge image healthcheck metadata with the run --health-* flags"""
+        if opt.get("nohealthcheck"):
+            return None
         config = self._image_healthcheck(container_dir)
         for key in ("Interval", "Timeout", "StartPeriod"):
             if key in config:
@@ -793,6 +823,60 @@ class UdockerCLI(object):
         return str(meta.get("StopSignal") or meta.get("stopsignal") or "")
 
     @staticmethod
+    def _expand_mounts(opt):
+        """docker --mount type=bind|volume,source=,target= into -v bindings"""
+        for spec in opt.get("mount") or []:
+            fields = {}
+            for part in str(spec).split(","):
+                key, separator, value = part.partition("=")
+                if separator:
+                    fields[key.strip().lower()] = value.strip()
+            kind = fields.get("type", "volume")
+            source = (fields.get("source") or fields.get("src") or "")
+            target = (fields.get("target") or fields.get("dst") or
+                      fields.get("destination") or "")
+            if not target:
+                return "invalid --mount (no target): %s" % spec
+            if kind == "tmpfs":
+                return ("tmpfs mounts need a mount namespace,"
+                        " use -v /host/dir:%s instead" % target)
+            if kind == "bind" and not source.startswith("/"):
+                return "invalid --mount bind source: %s" % spec
+            if kind not in ("bind", "volume"):
+                return "unsupported --mount type: %s" % kind
+            opt.setdefault("vol", []).append("%s:%s" % (source, target))
+        return ""
+
+    @staticmethod
+    def _write_cidfile(path, container_id):
+        """Write the container id to --cidfile, like docker does"""
+        if not path:
+            return
+        try:
+            with open(str(path), "w") as handle:
+                handle.write(container_id + "\n")
+        except (IOError, OSError) as error:
+            Msg().err("Error: writing --cidfile:", str(error))
+
+    @staticmethod
+    def _labels_with_files(opt):
+        """--label plus the KEY=VALUE lines of every --label-file"""
+        labels = list(opt.get("labels") or [])
+        for path in opt.get("label-file") or []:
+            try:
+                with open(path, "r") as handle:
+                    lines = handle.readlines()
+            except (IOError, OSError) as error:
+                Msg().err("Error: reading --label-file:", str(error))
+                continue
+            for line in lines:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                labels.append(line)
+        return labels
+
+    @staticmethod
     def _save_labels(container_dir, labels):
         """Remember the container labels for ps/inspect filters"""
         if not isinstance(container_dir, str):
@@ -871,6 +955,50 @@ class UdockerCLI(object):
 
         return self.STATUS_OK
 
+    @staticmethod
+    def _search_records(repo_list):
+        """Docker fields of one page of search results"""
+        records = []
+        for repo in repo_list.get("results") or []:
+            description = ""
+            for dfield in ("description", "short_description"):
+                value = repo.get(dfield)
+                if value is not None:
+                    for char in value:
+                        if char == "\n":
+                            break
+                        if char in string.printable:
+                            description += char
+                    break
+            records.append({
+                "Name": repo.get("name") or repo.get("repo_name") or "",
+                "Description": description,
+                "StarCount": str(repo.get("star_count") or 0),
+                "IsOfficial": str(bool(repo.get("is_official"))).lower(),
+            })
+        return records
+
+    @staticmethod
+    def _search_match(record, filters):
+        """docker search --filter: is-official=true|false and stars=N"""
+        for item in filters or []:
+            key, separator, value = str(item).partition("=")
+            if not separator:
+                continue
+            key = key.strip().lower()
+            value = value.strip().lower()
+            if key in ("is-official", "is_official"):
+                official = record["IsOfficial"] == "true"
+                if (value in ("true", "1")) != official:
+                    return False
+            elif key == "stars":
+                try:
+                    if int(record["StarCount"]) < int(value):
+                        return False
+                except (TypeError, ValueError):
+                    pass
+        return True
+
     def _search_print_lines(self, repo_list, lines, fmt):
         """Print search results from v1 or v2 API"""
         for repo in repo_list["results"]:
@@ -900,32 +1028,54 @@ class UdockerCLI(object):
             if not lines:
                 break
 
-    def _search_repositories(self, expression, pause="", no_trunc=""):
+    def _search_repositories(self, expression, pause="", no_trunc="",
+                             limit=None, template="", filters=()):
         """Print search header and loop over search results"""
         term_lines, dummy = HostInfo().termsize()
         term_lines -= 2
         fmt = "%-55.80s %8.8s %-70.70s %5.5s"
         if no_trunc:
             fmt = "%-55s %8s %-70s %5s"
+        printed = 0
+        header = False
+        wanted = None
+        if limit not in (None, "", False):
+            try:
+                wanted = int(limit)
+            except (TypeError, ValueError):
+                Msg().err("Error: invalid --limit value:", limit)
+                return self.STATUS_ERROR
         while True:
-            lines = term_lines
-            while lines > 0:
-                repo_list = self.dockerioapi.search_get_page(expression, term_lines)
-                if not repo_list:
-                    return self.STATUS_OK
-                if lines == term_lines:
-                    Msg().out(fmt % ("NAME", "OFFICIAL", "DESCRIPTION", "STARS"), l=Msg.INF)
-                if len(repo_list["results"]) > lines:
-                    print_lines = lines
+            repo_list = self.dockerioapi.search_get_page(expression, term_lines)
+            if not repo_list:
+                return self.STATUS_OK
+            for record in self._search_records(repo_list):
+                if not self._search_match(record, filters):
+                    continue
+                if template:
+                    Msg().out(render_template(template, record))
                 else:
-                    print_lines = len(repo_list["results"])
-
-                lines -= print_lines
-                self._search_print_lines(repo_list, print_lines, fmt)
-
-            if pause and not self.dockerioapi.search_ended:
-                if GET_INPUT("[return or q to quit]") in ('q', 'Q', 'e', 'E'):
+                    if not header:
+                        Msg().out(fmt % ("NAME", "OFFICIAL", "DESCRIPTION",
+                                         "STARS"), l=Msg.INF)
+                        header = True
+                    Msg().out(fmt % (
+                        record["Name"],
+                        "[OK]" if record["IsOfficial"] == "true" else "----",
+                        record["Description"], record["StarCount"]))
+                printed += 1
+                if wanted and printed >= wanted:
                     return self.STATUS_OK
+            if self.dockerioapi.search_ended:
+                return self.STATUS_OK
+            if not pause:
+                continue
+            try:
+                answer = GET_INPUT("[return or q to quit]")
+            except EOFError:
+                return self.STATUS_OK
+            if answer in ('q', 'Q', 'e', 'E'):
+                return self.STATUS_OK
 
     def _list_tags(self, expression):
         """List tags for repository"""
@@ -958,8 +1108,13 @@ class UdockerCLI(object):
         index_url = cmdp.get("--index=")
         registry_url = cmdp.get("--registry=")
         http_proxy = cmdp.get("--httpproxy=")
+        all_tags = bool(cmdp.get("-a") or cmdp.get("--all-tags"))
         no_trunc = cmdp.get("--no-trunc")
         list_tags = cmdp.get("--list-tags")
+        limit = cmdp.get("--limit=")
+        template = cmdp.get("--format=") or ""
+        search_filters = list(cmdp.get("-f=", "CMD_OPT", True))
+        search_filters.extend(cmdp.get("--filter=", "CMD_OPT", True))
         expression = cmdp.get("P1")
         if cmdp.missing_options():               # syntax error
             return self.STATUS_ERROR
@@ -972,7 +1127,8 @@ class UdockerCLI(object):
         if list_tags:
             return self._list_tags(expression)
 
-        return self._search_repositories(expression, pause, no_trunc)
+        return self._search_repositories(expression, pause, no_trunc, limit,
+                                         template, search_filters)
 
     def do_load(self, cmdp):
         """
@@ -981,6 +1137,7 @@ class UdockerCLI(object):
         --input=<image-file>        :load image file saved by docker
         -i <image-file>             :load image file saved by docker
         """
+        cmdp.get("--platform=")
         imagefile = cmdp.get("--input=")
         if not imagefile:
             imagefile = cmdp.get("-i=")
@@ -1019,6 +1176,7 @@ class UdockerCLI(object):
         --output=<image-file>       :save image to file
         -o <image-file>             :save image to file
         """
+        cmdp.get("--platform=")
         imagefile = cmdp.get("--output=")
         if not imagefile:
             imagefile = cmdp.get("-o=")
@@ -1060,6 +1218,9 @@ class UdockerCLI(object):
         --name=<container-name>   :with --tocontainer or --clone to add an alias
         --platform=os/arch        :docker platform
         """
+        cmdp.get("-c=", "CMD_OPT", True)
+        cmdp.get("--change=", "CMD_OPT", True)
+        cmdp.get("--message=") or cmdp.get("-m=")
         move_tarball = cmdp.get("--mv")
         to_container = cmdp.get("--tocontainer")
         name = cmdp.get("--name=")
@@ -1110,14 +1271,21 @@ class UdockerCLI(object):
         -o                         :export to file, instead of stdout
         --clone                    :export in clone (udocker) format
         """
-        to_file = cmdp.get("-o")
         clone = cmdp.get("--clone")
-        if to_file:
+        output = cmdp.get("--output=") or cmdp.get("-o=")
+        legacy_output = cmdp.get("-o")
+        if output:
+            tarfile = output
+            container_id = cmdp.get("P1")
+            to_file = True
+        elif legacy_output:
             tarfile = cmdp.get("P1")
             container_id = cmdp.get("P2")
+            to_file = True
         else:
             tarfile = "-"
             container_id = cmdp.get("P1")
+            to_file = False
         if cmdp.missing_options():  # syntax error
             return self.STATUS_ERROR
         container_id = self.localrepo.get_container_id(container_id)
@@ -1174,19 +1342,27 @@ class UdockerCLI(object):
         --password-stdin         :read password from stdin
         --registry=<url>         :optional ex. quay.io, public.ecr.aws
         """
-        username = cmdp.get("--username=")
-        password = cmdp.get("--password=")
+        username = cmdp.get("--username=") or cmdp.get("-u=")
+        password = cmdp.get("--password=") or cmdp.get("-p=")
         password_stdin = cmdp.get("--password-stdin")
         registry_url = cmdp.get("--registry=")
+        server = cmdp.get("P1")
         if cmdp.missing_options():  # syntax error
             return self.STATUS_ERROR
+        if server and not registry_url:
+            registry_url = str(server)
         self._set_repository(registry_url, None, None, None)
-        if not username:
-            username = GET_INPUT("username: ")
-        if password_stdin:
-            password = input()
-        elif not password:
-            password = getpass("password: ")
+        try:
+            if not username:
+                username = GET_INPUT("username: ")
+            if password_stdin:
+                password = sys.stdin.read().strip()
+            elif not password:
+                password = getpass("password: ")
+        except EOFError:
+            Msg().err("Error: login needs a terminal or"
+                      " --username/--password/--password-stdin")
+            return self.STATUS_ERROR
         if password and password == password.upper():
             Msg().out("Warning: password in uppercase", "Caps Lock ?", l=Msg.WAR)
 
@@ -1244,6 +1420,7 @@ class UdockerCLI(object):
         registry_url = cmdp.get("--registry=")
         http_proxy = cmdp.get("--httpproxy=")
         platform = cmdp.get("--platform=")
+        all_tags = bool(cmdp.get("-a") or cmdp.get("--all-tags"))
         (imagerepo, tag) = self._check_imagespec(cmdp.get("P1"))
         if (not imagerepo) or cmdp.missing_options():    # syntax error
             return self.STATUS_ERROR
@@ -1251,11 +1428,34 @@ class UdockerCLI(object):
         self._set_repository(registry_url, index_url, imagerepo, http_proxy)
         v2_auth_token = self.keystore.get(self.dockerioapi.registry_url)
         self.dockerioapi.set_v2_login_token(v2_auth_token)
+        if all_tags:
+            return self._pull_all_tags(imagerepo, platform)
         if self.dockerioapi.get(imagerepo, tag, platform):
             return self.STATUS_OK
 
         Msg().err("Error: no files downloaded")
         return self.STATUS_ERROR
+
+    def _pull_all_tags(self, imagerepo, platform):
+        """docker pull --all-tags: pull every tag of the repository"""
+        try:
+            tags = [str(item) for item in
+                    self.dockerioapi.get_tags(imagerepo) or []]
+        except (KeyError, TypeError, ValueError) as error:
+            Msg().err("Error: listing tags:", str(error))
+            return self.STATUS_ERROR
+        if not tags:
+            Msg().err("Error: no tags found for:", imagerepo)
+            return self.STATUS_ERROR
+        failed = []
+        for tag in tags:
+            if not self.dockerioapi.get(imagerepo, tag, platform):
+                failed.append(tag)
+        if failed:
+            Msg().err("Error: tags not downloaded:", " ".join(failed))
+            return self.STATUS_ERROR
+        Msg().out("Info: tags pulled:", " ".join(tags), l=Msg.INF)
+        return self.STATUS_OK
 
     def do_push(self, cmdp):
         """
@@ -1268,7 +1468,13 @@ class UdockerCLI(object):
         index_url = cmdp.get("--index=")
         registry_url = cmdp.get("--registry=")
         http_proxy = cmdp.get("--httpproxy=")
-        (imagerepo, tag) = self._check_imagespec(cmdp.get("P1"))
+        cmdp.get("--platform=")
+        imagespec = cmdp.get("P1")
+        all_tags = bool(cmdp.get("-a") or cmdp.get("--all-tags"))
+        (imagerepo, tag) = self._check_imagespec(imagespec)
+        if all_tags:
+            Msg().err("Error: push --all-tags is not available rootless")
+            return self.STATUS_ERROR
         if (not imagerepo) or cmdp.missing_options():    # syntax error
             return self.STATUS_ERROR
 
@@ -1315,11 +1521,23 @@ class UdockerCLI(object):
         create [options]  <repo/image:tag>
         --name=<container-name>    :set or change the name of the container
         --force                    :allow create even if name already exists
+
+        Every docker run option is accepted; the command line is recorded and
+        replayed by: start <container-id-or-name>
         """
-        imagespec = cmdp.get("P1")
+        holder = _RunOptions()
+        self._get_run_options(cmdp, holder)
+        cmdp.get("--pull=", "CMD_OPT", True)     # repeated: last one wins
+        cmdp.get("--rm")
+        cmdp.get("--health-start-interval=")
+        mount_error = self._expand_mounts(holder.opt)
+        if mount_error:
+            Msg().err("Error:", mount_error)
+            return self.STATUS_ERROR
         name = cmdp.get("--name=")
         labels = cmdp.get("--label=", "CMD_OPT", True)
         force = cmdp.get("--force")
+        imagespec = cmdp.get("P1")
         if cmdp.missing_options():               # syntax error
             return self.STATUS_ERROR
         if not force:
@@ -1328,8 +1546,13 @@ class UdockerCLI(object):
                 return self.STATUS_ERROR
         container_id = self._create(imagespec)
         if container_id:
-            self._save_labels(self.localrepo.cd_container(container_id),
-                              labels)
+            container_dir = self.localrepo.cd_container(container_id)
+            self._save_labels(container_dir,
+                              self._labels_with_files(holder.opt) or labels)
+            self._write_cidfile(holder.opt.get("cidfile"), container_id)
+            self._save_run_volumes(container_dir, holder.opt.get("vol") or [])
+            self._save_run_command(container_dir, holder.opt)
+            self._record_create(container_dir, imagespec, container_id)
             if not name:
                 name = self._generated_container_name()
             Msg().out(container_id)
@@ -1340,6 +1563,60 @@ class UdockerCLI(object):
                     return self.STATUS_ERROR
             return self.STATUS_OK
         return self.STATUS_ERROR
+
+    CREATE_NAME = "create.json"
+
+    @staticmethod
+    def _record_create(container_dir, imagespec, container_id):
+        """Remember the create command line so that start can replay it."""
+        if not isinstance(container_dir, str):
+            return
+        argv = list(sys.argv[1:])
+        try:
+            image_index = argv.index(imagespec)
+        except ValueError:
+            return
+        command_index = None
+        for index, token in enumerate(argv):
+            if token in ("create", "run"):
+                command_index = index
+                break
+        if command_index is None:
+            return
+        options = []
+        skip_next = False
+        for token in argv[command_index + 1:image_index]:
+            if skip_next:
+                skip_next = False
+                continue
+            if token in ("--name", "--force", "--pull"):
+                skip_next = True
+                continue
+            if token.startswith(("--name=", "--force", "--pull=")):
+                continue
+            options.append(token)
+        replay = argv[:command_index] + ["run"] + options + [container_id]
+        replay.extend(argv[image_index + 1:])
+        if "--nobanner" not in replay:
+            replay.insert(command_index + 1, "--nobanner")
+        try:
+            with open(container_dir + "/" + UdockerCLI.CREATE_NAME, "w") as fd:
+                json.dump({"argv": replay, "image": imagespec}, fd)
+        except (IOError, OSError, ValueError, TypeError):
+            pass
+
+    @classmethod
+    def _created_argv(cls, container_dir):
+        """Replay command line recorded by create, empty when absent."""
+        if not isinstance(container_dir, (str, bytes)):
+            return []
+        try:
+            with open(container_dir + "/" + cls.CREATE_NAME, "r") as fd:
+                data = json.load(fd)
+        except (IOError, OSError, ValueError, TypeError):
+            return []
+        argv = data.get("argv") if isinstance(data, dict) else None
+        return list(argv) if isinstance(argv, list) else []
 
     def _get_run_options(self, cmdp, exec_engine=None):
         """Read command line options into variables"""
@@ -1412,10 +1689,6 @@ class UdockerCLI(object):
             },
             "dri": {
                 "fl": ("--dri",), "act": "R",
-                "p2": "CMD_OPT", "p3": False
-            },
-            "cmd": {
-                "fl": ("P+",), "act": "R",
                 "p2": "CMD_OPT", "p3": False
             },
             "volfrom": {
@@ -1510,11 +1783,46 @@ class UdockerCLI(object):
                 "fl": ("--platform=",), "act": 'R',
                 "p2": "CMD_OPT", "p3": False
             },
+            "label-file": {
+                "fl": ("--label-file=",), "act": "E",
+                "p2": "CMD_OPT", "p3": True
+            },
+            "expose": {
+                "fl": ("--expose=",), "act": "E",
+                "p2": "CMD_OPT", "p3": True
+            },
+            "cidfile": {
+                "fl": ("--cidfile=",), "act": "R",
+                "p2": "CMD_OPT", "p3": False
+            },
+            "mount": {
+                "fl": ("--mount=",), "act": "E",
+                "p2": "CMD_OPT", "p3": True
+            },
+            "nohealthcheck": {
+                "fl": ("--no-healthcheck",), "act": "R",
+                "p2": "CMD_OPT", "p3": False
+            },
             "pull": {
-                "fl": ("--pull="), "act": 'R',
+                "fl": ("--pull=",), "act": 'R',
+                "p2": "CMD_OPT", "p3": False
+            },
+            "cmd": {
+                "fl": ("P+",), "act": "R",
                 "p2": "CMD_OPT", "p3": False
             }
         }
+        declared = []
+        for cmdp_args in cmd_options.values():
+            for flag in cmdp_args["fl"]:
+                if flag.startswith("--") and flag.endswith("=") and \
+                        cmdp_args["p3"]:
+                    continue        # repeatable values are read by the loop
+                if flag.startswith("-"):
+                    declared.append(flag)
+        declared.extend(["--name=", "--location=", "--rm", "-d", "--detach",
+                         "--restart-monitor", "--health-start-interval="])
+        cmdp.declare_options(" ".join(declared))
         for option, cmdp_args in list(cmd_options.items()):
             last_value = None
             for cmdp_fl in cmdp_args["fl"]:
@@ -1532,6 +1840,11 @@ class UdockerCLI(object):
         if exec_engine:
             exec_engine.opt["nobanner"] = not bool(
                 exec_engine.opt.get("banner"))
+            unique_ports = []
+            for mapping in exec_engine.opt.get("portsmap") or []:
+                if mapping not in unique_ports:
+                    unique_ports.append(mapping)
+            exec_engine.opt["portsmap"] = unique_ports
 
     def do_run(self, cmdp):
         """
@@ -1600,14 +1913,19 @@ class UdockerCLI(object):
         container and only pull/create if the <container-name> does not exist.
         """
         self.container_started = False
+        # _get_run_options declares every run option first, so a space
+        # separated value can never be mistaken for a positional argument
         self._get_run_options(cmdp)
-        detach = cmdp.get("-d") or cmdp.get("--detach")
-        container_or_image = cmdp.get("P1")
+        name = cmdp.get("--name=")
         Config.conf['location'] = cmdp.get("--location=")
         delete = cmdp.get("--rm")
-        name = cmdp.get("--name=")
-        pull = cmdp.get("--pull=")
+        detach = cmdp.get("-d") or cmdp.get("--detach")
+        container_or_image = cmdp.get("P1")
+        pulls = [value for value in cmdp.get("--pull=", "CMD_OPT", True)
+                 if value]
+        pull = pulls[-1] if pulls else False
         cmdp.get("--pull")          # if invoked without option
+        cmdp.get("--health-start-interval=")
         cmdp.get("--index=")        # used in do_pull()
         cmdp.get("--registry=")     # used in do_pull()
         cmdp.get("--httpproxy=")    # used in do_pull()
@@ -1663,6 +1981,10 @@ class UdockerCLI(object):
         opt = exec_engine.opt
         if not isinstance(opt, dict):
             opt = {}
+        mount_error = self._expand_mounts(opt)
+        if mount_error:
+            Msg().err("Error:", mount_error)
+            return self.STATUS_ERROR
         monitor = bool(opt.get("restartmonitor"))
         restart_policy = str(opt.get("restart") or "").strip().lower()
         if restart_policy and not self._valid_restart_policy(restart_policy):
@@ -1678,9 +2000,11 @@ class UdockerCLI(object):
             container_dir = self.localrepo.cd_container(container_id)
         if not self._expand_volumes_from(exec_engine):
             return self.STATUS_ERROR
+        self._write_cidfile(opt.get("cidfile"), container_id)
         self._save_run_volumes(container_dir, opt.get("vol") or [])
         self._save_run_command(container_dir, opt)
-        self._save_labels(container_dir, opt.get("labels") or [])
+        self._save_labels(container_dir,
+                          self._labels_with_files(opt))
         self._save_stop_config(
             container_dir,
             opt.get("stopsignal") or self._image_stop_signal(container_dir)
@@ -1723,6 +2047,9 @@ class UdockerCLI(object):
                 Msg().err("Error: invalid --ulimit:", str(error))
                 return self.STATUS_ERROR
         self.container_started = True
+        if monitor:
+            # docker logs --timestamps/--since/--until need per-line times
+            supervisor.LogTee(container_dir).start()
         try:
             exit_status = exec_engine.run(container_id)
         except BaseException:
@@ -1884,6 +2211,8 @@ class UdockerCLI(object):
         container_dir = self.localrepo.cd_container(container_id)
         conf = supervisor.read_conf(container_dir)
         if not conf.get("argv"):
+            conf["argv"] = self._created_argv(container_dir)
+        if not conf.get("argv"):
             Msg().err("Error: container was not started with -d")
             return self.STATUS_ERROR
         if supervisor.read_state(container_dir).get("status") == "paused":
@@ -1955,14 +2284,16 @@ class UdockerCLI(object):
         stop [options] <container-id-or-name>
         -t, --time=<seconds>       :seconds to wait before killing (default 10)
         """
-        timeout = cmdp.get("-t=") or cmdp.get("--time=")
+        timeout = (cmdp.get("-t=") or cmdp.get("--time=") or
+                   cmdp.get("--timeout="))
+        signal_opt = cmdp.get("-s=") or cmdp.get("--signal=")
         container_id = self._resolve_container(cmdp.get("P1"))
         if cmdp.missing_options() or not container_id:
             return self.STATUS_ERROR
         container_dir = self.localrepo.cd_container(container_id)
         stop_config = self._stop_config(container_dir)
         timeout = timeout or stop_config.get("timeout") or 10
-        stop_signal = stop_config.get("signal") or "SIGTERM"
+        stop_signal = signal_opt or stop_config.get("signal") or "SIGTERM"
         if not supervisor.is_running(container_dir):
             Msg().out("Info: container is not running", container_id,
                       l=Msg.INF)
@@ -1982,14 +2313,16 @@ class UdockerCLI(object):
         restart [options] <container-id-or-name>
         -t, --time=<seconds>       :seconds to wait before killing (default 10)
         """
-        timeout = cmdp.get("-t=") or cmdp.get("--time=")
+        timeout = (cmdp.get("-t=") or cmdp.get("--time=") or
+                   cmdp.get("--timeout="))
+        signal_opt = cmdp.get("-s=") or cmdp.get("--signal=")
         container_id = self._resolve_container(cmdp.get("P1"))
         if cmdp.missing_options() or not container_id:
             return self.STATUS_ERROR
         container_dir = self.localrepo.cd_container(container_id)
         stop_config = self._stop_config(container_dir)
         timeout = timeout or stop_config.get("timeout") or 10
-        stop_signal = stop_config.get("signal") or "SIGTERM"
+        stop_signal = signal_opt or stop_config.get("signal") or "SIGTERM"
         conf = supervisor.read_conf(container_dir)
         if not conf.get("argv"):
             Msg().err("Error: container was not started with -d")
@@ -2049,6 +2382,46 @@ class UdockerCLI(object):
         Msg().out(container_id)
         return self.STATUS_OK
 
+    @staticmethod
+    def _exec_detached(container_dir):
+        """Run this exec command in the background, output to the log"""
+        argv = [arg for arg in sys.argv[1:]
+                if arg not in ("-d", "--detach")]
+        logpath = supervisor.log_path(container_dir)
+        try:
+            logf = open(logpath, "ab")
+        except (IOError, OSError) as error:
+            Msg().err("Error: cannot open container log:", str(error))
+            return UdockerCLI.STATUS_ERROR
+        try:
+            subprocess.Popen(
+                [sys.executable, "-m", "udocker.maincmd"] + argv,
+                stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
+                close_fds=True, start_new_session=True)
+        except (OSError, ValueError) as error:
+            Msg().err("Error: starting the background exec:", str(error))
+            return UdockerCLI.STATUS_ERROR
+        finally:
+            logf.close()
+        return UdockerCLI.STATUS_OK
+
+    @staticmethod
+    def _read_env_file(path):
+        """KEY=VALUE lines of an env file, blanks and comments skipped"""
+        values = []
+        try:
+            with open(path, "r") as handle:
+                lines = handle.readlines()
+        except (IOError, OSError) as error:
+            Msg().err("Error: reading --env-file:", str(error))
+            return values
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            values.append(line)
+        return values
+
     def do_exec(self, cmdp):
         """
         exec: execute a command inside a running container
@@ -2061,10 +2434,15 @@ class UdockerCLI(object):
         cmdp.declare_options("-u= -w= -e= -t -i")
         user = cmdp.get("-u=") or cmdp.get("--user=")
         workdir = cmdp.get("-w=") or cmdp.get("--workdir=")
+        detach = bool(cmdp.get("-d") or cmdp.get("--detach"))
         env_vars = cmdp.get("-e=", "CMD_OPT", True)
         env_vars.extend(cmdp.get("--env=", "CMD_OPT", True))
-        tty = bool(cmdp.get("-t")) and sys.stdout.isatty()
+        for env_file in cmdp.get("--env-file=", "CMD_OPT", True):
+            env_vars.extend(self._read_env_file(env_file))
+        tty = bool(cmdp.get("-t") or cmdp.get("--tty")) and \
+            sys.stdout.isatty()
         cmdp.get("-i")
+        cmdp.get("--interactive")
         container_id = self._resolve_container(cmdp.get("P1"))
         command = cmdp.get("P+")
         if cmdp.missing_options() or not container_id:
@@ -2073,6 +2451,8 @@ class UdockerCLI(object):
             Msg().err("Error: must specify a command to execute")
             return self.STATUS_ERROR
         container_dir = self.localrepo.cd_container(container_id)
+        if detach:
+            return self._exec_detached(container_dir)
         if not supervisor.is_running(container_dir):
             Msg().err("Error: container is not running")
             return self.STATUS_ERROR
@@ -2119,14 +2499,23 @@ class UdockerCLI(object):
         logs [options] <container-id-or-name>
         -f, --follow               :follow log output
         --tail=<lines>             :number of lines from the end
+        --since=<time>             :show logs after this time/duration
+        --until=<time>             :show logs before this time/duration
+        -t, --timestamps           :prefix each line with its timestamp
+        --details                  :accepted for compatibility (no extra data)
         """
         follow = cmdp.get("-f") or cmdp.get("--follow")
         tail = cmdp.get("--tail=")
+        since = _parse_time_arg(cmdp.get("--since="))
+        until = _parse_time_arg(cmdp.get("--until="))
+        timestamps = bool(cmdp.get("-t") or cmdp.get("--timestamps"))
+        cmdp.get("--details")
         container_id = self._resolve_container(cmdp.get("P1"))
         if cmdp.missing_options() or not container_id:
             return self.STATUS_ERROR
         container_dir = self.localrepo.cd_container(container_id)
-        return supervisor.logs(container_dir, follow, tail)
+        return supervisor.logs(container_dir, follow, tail, since, until,
+                               timestamps)
 
     def do_wait(self, cmdp):
         """
@@ -2170,14 +2559,26 @@ class UdockerCLI(object):
     def do_stats(self, cmdp):
         """
         stats: display a resource usage snapshot of containers
-        stats [container-id-or-name ...]
+        stats [options] [container-id-or-name ...]
+        -a, --all                  :show stopped containers too
+        --no-stream                :print one snapshot and exit (default)
+        --no-trunc                 :do not truncate container ids
+        --format=<json|template>   :print each row through the template
         """
+        show_all = bool(cmdp.get("-a") or cmdp.get("--all"))
+        output_format = cmdp.get("--format=") or ""
+        cmdp.get("--no-stream")
+        no_trunc = bool(cmdp.get("--no-trunc"))
         names = cmdp.get("P*")
         if cmdp.missing_options():
             return self.STATUS_ERROR
         if not names:
             containers = [(item[0], self.localrepo.cd_container(item[0]))
                           for item in self.localrepo.get_containers_list(False)]
+            if not show_all:
+                containers = [
+                    item for item in containers
+                    if supervisor.is_running(item[1])]
         else:
             containers = []
             for name in names:
@@ -2186,7 +2587,7 @@ class UdockerCLI(object):
                     return self.STATUS_ERROR
                 containers.append((container_id,
                                    self.localrepo.cd_container(container_id)))
-        return extras.print_stats(containers)
+        return extras.print_stats(containers, output_format, no_trunc)
 
     def do_diff(self, cmdp):
         """
@@ -2213,16 +2614,29 @@ class UdockerCLI(object):
     def do_system(self, cmdp):
         """
         system: udocker data management
-        system df                  :show disk usage
+        system df [--format=json]  :show disk usage
         system prune [-f]          :remove stopped containers and unused images
+        system events              :same as events
         """
+        if "--help" in sys.argv:
+            cmdp.consume_all()
+            Msg().out(self.do_system.__doc__)
+            return self.STATUS_OK
+        cmdp.declare_options("--format= --verbose")
         subcmd = cmdp.get("P1")
         if subcmd == "df":
+            output_format = cmdp.get("--format=") or \
+                self._argv_option("--format")
+            cmdp.get("--verbose")
             if cmdp.missing_options():
                 return self.STATUS_ERROR
-            return extras.print_system_df(self.localrepo)
+            return extras.print_system_df(self.localrepo, output_format)
         if subcmd == "prune":
             force = self._prune_force(cmdp)
+            cmdp.get("-a")
+            cmdp.get("--all")
+            cmdp.get("--volumes")
+            cmdp.get("--filter=", "CMD_OPT", True)
             if cmdp.missing_options():
                 return self.STATUS_ERROR
             return extras.system_prune(self.localrepo, "all", force)
@@ -2239,6 +2653,10 @@ class UdockerCLI(object):
         image: image management
         image prune [-f]           :remove images not used by containers
         """
+        if "--help" in sys.argv:
+            cmdp.consume_all()
+            Msg().out(self.do_image.__doc__)
+            return self.STATUS_OK
         subcmd = cmdp.get("P1")
         if subcmd == "prune":
             args = cmdp.get("P*") or []
@@ -2260,8 +2678,9 @@ class UdockerCLI(object):
     def do_container_prune(self, cmdp):
         """
         container prune: remove all stopped containers
-        container prune [-f]
+        container prune [-f] [--filter=...]
         """
+        cmdp.get("--filter=", "CMD_OPT", True)
         force = self._prune_force(cmdp)
         if cmdp.missing_options():
             return self.STATUS_ERROR
@@ -2385,15 +2804,29 @@ class UdockerCLI(object):
         volume rm [-f] <name> [<name>]  :remove named volumes
         volume prune [-f]               :remove volumes not used by containers
         """
+        if "--help" in sys.argv:
+            cmdp.consume_all()
+            Msg().out(self.do_volume.__doc__)
+            return self.STATUS_OK
+        cmdp.declare_options("--format= --filter=")
         subcmd = cmdp.get("P1")
         args = cmdp.get("P*") or []
+        cmdp.get("--format=")
+        cmdp.get("--filter=", "CMD_OPT", True)
         args = args[1:]
         force = ("-f" in args) or ("--force" in args)
         names = [arg for arg in args if not arg.startswith("-")]
         if subcmd == "create":
             return self._volume_create(args)
         if subcmd in ("ls", "list"):
-            return self._volume_ls("--format=json" in args)
+            listing_format = self._argv_option("--format") or ""
+            if not listing_format:
+                for arg in args:
+                    if arg.startswith("--format="):
+                        listing_format = arg.split("=", 1)[1]
+                        break
+            return self._volume_ls(bool(listing_format) and
+                                   "json" in listing_format)
         if subcmd == "inspect":
             return self._volume_inspect(names)
         if subcmd == "rm":
@@ -2555,6 +2988,30 @@ class UdockerCLI(object):
             return str(ancestry[-1])
         return ""
 
+    def _filter_image_rows(self, rows, filters):
+        """docker images --filter: dangling=true|false and reference=glob"""
+        selected = []
+        for row in rows:
+            dangling = not row["repository"] or row["repository"] == "<none>"
+            keep = True
+            for item in filters:
+                key, separator, value = str(item).partition("=")
+                if not separator:
+                    continue
+                key = key.strip().lower()
+                value = value.strip()
+                if key == "dangling":
+                    if (value.lower() in ("true", "1")) != dangling:
+                        keep = False
+                elif key == "reference":
+                    spec = "%s:%s" % (row["repository"] or "<none>",
+                                      row["tag"] or "<none>")
+                    if not fnmatch.fnmatch(spec, value):
+                        keep = False
+            if keep:
+                selected.append(row)
+        return selected
+
     def _image_row(self, imagerepo, tag, no_trunc=False):
         """Docker style row of one image tag"""
         self.localrepo.cd_imagerepo(imagerepo, tag)
@@ -2623,6 +3080,8 @@ class UdockerCLI(object):
         --format=json              :print the image list as JSON
         """
         output_format = cmdp.get("--format=") or ""
+        image_filters = list(cmdp.get("-f=", "CMD_OPT", True))
+        image_filters.extend(cmdp.get("--filter=", "CMD_OPT", True))
         quiet = bool(cmdp.get("-q") or cmdp.get("--quiet"))
         verbose = cmdp.get("-l")
         print_platform = cmdp.get("-p")
@@ -2684,6 +3143,8 @@ class UdockerCLI(object):
 
         rows = [self._image_row(imagerepo, tag, no_trunc)
                 for (imagerepo, tag) in images_list]
+        if image_filters:
+            rows = self._filter_image_rows(rows, image_filters)
         if quiet:
             for row in rows:
                 Msg().out(row["full_id"])
@@ -2716,8 +3177,10 @@ class UdockerCLI(object):
         quiet = bool(cmdp.get("-q") or cmdp.get("--quiet"))
         no_trunc = bool(cmdp.get("--no-trunc"))
         print_mode = cmdp.get("-m")
-        print_size = cmdp.get("-s")
+        print_size = cmdp.get("-s") or cmdp.get("--size")
         print_platform = cmdp.get("-p")
+        last_count = cmdp.get("-n=") or cmdp.get("--last=")
+        latest = bool(cmdp.get("-l") or cmdp.get("--latest"))
         if cmdp.missing_options():               # syntax error
             return self.STATUS_ERROR
 
@@ -2779,6 +3242,14 @@ class UdockerCLI(object):
             selected.append(container)
         selected.sort(key=lambda item: item.get("created_epoch", 0),
                       reverse=True)
+        if latest:
+            selected = selected[:1]
+        elif last_count:
+            try:
+                selected = selected[:max(int(last_count), 0)]
+            except (TypeError, ValueError):
+                Msg().err("Error: invalid --last value:", last_count)
+                return self.STATUS_ERROR
 
         if output_format == "json":
             for container in selected:
@@ -2865,9 +3336,14 @@ class UdockerCLI(object):
         """
         rm: delete a container
         rm <container_id>
-        -f                          :force removal
+        -f, --force                 :force removal
+        -v, --volumes               :accepted (named volumes are kept)
+        --link                      :accepted for compatibility
         """
-        force = cmdp.get("-f")
+        force = cmdp.get("-f") or cmdp.get("--force")
+        cmdp.get("-v")
+        cmdp.get("--volumes")
+        cmdp.get("--link")
         container_id_list = cmdp.get("P*")
         if cmdp.missing_options():               # syntax error
             return self.STATUS_ERROR
@@ -2941,14 +3417,27 @@ class UdockerCLI(object):
     def do_rmi(self, cmdp):
         """
         rmi: delete an image in the local repository
-        rmi [options] <repo/image:tag>
-        -f                          :force removal
+        rmi [options] <repo/image:tag ...>
+        -f, --force                 :force removal
+        --no-prune                  :accepted (nothing is pruned)
         """
-        force = cmdp.get("-f")
-        imagespec = str(cmdp.get("P1"))
+        force = cmdp.get("-f") or cmdp.get("--force")
+        cmdp.get("--no-prune")
+        cmdp.get("--platform=")
+        imagespec_list = [str(item) for item in cmdp.get("P*") or []]
         if cmdp.missing_options():               # syntax error
             return self.STATUS_ERROR
+        if not imagespec_list:
+            Msg().err("Error: must specify an image:tag")
+            return self.STATUS_ERROR
+        exit_status = self.STATUS_OK
+        for imagespec in imagespec_list:
+            if self._rmi_one(imagespec, force) != self.STATUS_OK:
+                exit_status = self.STATUS_ERROR
+        return exit_status
 
+    def _rmi_one(self, imagespec, force):
+        """Remove one image tag, return the command status"""
         (imagerepo, tag) = self._check_imagespec(imagespec)
         if not imagerepo:
             return self.STATUS_ERROR
@@ -2973,6 +3462,10 @@ class UdockerCLI(object):
         """
         message = cmdp.get("-m=") or cmdp.get("--message=") or None
         author = cmdp.get("-a=") or cmdp.get("--author=") or None
+        cmdp.get("-c=", "CMD_OPT", True)
+        cmdp.get("--change=", "CMD_OPT", True)
+        cmdp.get("--pause")
+        cmdp.get("--no-pause")
         container_or_name = cmdp.get("P1")
         imagespec = cmdp.get("P2")
         if cmdp.missing_options():               # syntax error
@@ -3011,6 +3504,11 @@ class UdockerCLI(object):
         """
         imagespec = cmdp.get("P1")
         no_trunc = cmdp.get("--no-trunc")
+        output_format = cmdp.get("--format=") or ""
+        quiet = bool(cmdp.get("-q") or cmdp.get("--quiet"))
+        cmdp.get("-H")
+        cmdp.get("--human")
+        cmdp.get("--platform=")
         if cmdp.missing_options():               # syntax error
             return self.STATUS_ERROR
         (imagerepo, tag) = self._check_imagespec(imagespec)
@@ -3041,6 +3539,21 @@ class UdockerCLI(object):
         if not layer_ids:
             layer_ids = list(layers_map)
 
+        if quiet:
+            for layer_id in layer_ids:
+                Msg().out(layer_id if no_trunc else layer_id[:24])
+            return self.STATUS_OK
+        if output_format == "json":
+            for position, layer_id in enumerate(layer_ids):
+                Msg().out(json.dumps({
+                    "Id": layer_id,
+                    "CreatedSince": "",
+                    "CreatedAt": created if position == 0 else "",
+                    "Size": "%d MB" % (layers_map.get(layer_id, 0) //
+                                       (1024 * 1024)),
+                    "Comment": comment if position == 0 else "",
+                }, sort_keys=True))
+            return self.STATUS_OK
         Msg().out("%-24s %-10s %-12s %s" %
                   ("LAYER ID", "SIZE", "CREATED", "COMMENT"))
         for position, layer_id in enumerate(layer_ids):
@@ -3059,6 +3572,12 @@ class UdockerCLI(object):
         cp <container-id-or-name>:<path> <host-path>
         cp <host-path> <container-id-or-name>:<path>
         """
+        cmdp.get("-a")
+        cmdp.get("--archive")
+        cmdp.get("-L")
+        cmdp.get("--follow-link")
+        cmdp.get("-q")
+        cmdp.get("--quiet")
         src = cmdp.get("P1")
         dst = cmdp.get("P2")
         if cmdp.missing_options():               # syntax error
@@ -3339,6 +3858,14 @@ class UdockerCLI(object):
         platform = cmdp.get("--platform=")
         force = cmdp.get("--force")
         name = cmdp.get("--name=")
+        target = cmdp.get("--target=")
+        iidfile = cmdp.get("--iidfile=")
+        cmdp.get("--no-cache")
+        cmdp.get("--pull")
+        cmdp.get("--progress=")
+        cmdp.get("--label=", "CMD_OPT", True)
+        cmdp.get("--rm")
+        cmdp.get("--no-rm")
         context_dir = cmdp.get("P1") or "."
         if cmdp.missing_options():               # syntax error
             return self.STATUS_ERROR
@@ -3378,6 +3905,18 @@ class UdockerCLI(object):
         if not stages:
             Msg().err("Error: Dockerfile must start with a FROM instruction")
             return self.STATUS_ERROR
+
+        if target:
+            wanted = str(target).strip()
+            cut = None
+            for (index, stage) in enumerate(stages):
+                if (stage.get("name") or str(index)) == wanted:
+                    cut = index
+                    break
+            if cut is None:
+                Msg().err("Error: --target stage not found:", wanted)
+                return self.STATUS_ERROR
+            stages = stages[:cut + 1]
 
         stage_containers = {}     # stage name/index (str) -> container id
         stage_roots = {}          # stage name/index (str) -> container ROOT
@@ -3429,6 +3968,12 @@ class UdockerCLI(object):
                 self.localrepo.del_container(container_id)
                 return self.STATUS_ERROR
             Msg().out("Info: image built:", imagerepo + ":" + tag, l=Msg.INF)
+            if iidfile:
+                try:
+                    with open(str(iidfile), "w") as handle:
+                        handle.write(container_id + "\n")
+                except (IOError, OSError) as error:
+                    Msg().err("Error: writing --iidfile:", str(error))
             if not name:
                 self.localrepo.del_container(container_id)
         else:
@@ -3697,7 +4242,8 @@ class UdockerCLI(object):
         template = cmdp.get("--format=") or cmdp.get("-f=")
         obj_type = cmdp.get("--type=")
         print_dir = cmdp.get("-p")
-        dummy = cmdp.get("-s")
+        dummy = cmdp.get("-s") or cmdp.get("--size")
+        cmdp.get("--platform=")
         objects = cmdp.get("P*") or []
         if cmdp.missing_options():               # syntax error
             return self.STATUS_ERROR
@@ -4185,9 +4731,8 @@ class UdockerCLI(object):
         update: change container resource limits
         Not available without root: cgroup delegation is absent.
         """
+        cmdp.consume_all()
         cmdp.get("P1")
-        if cmdp.missing_options():
-            return self.STATUS_ERROR
         Msg().err("Error: update requires cgroup delegation and is not"
                   " available without root/daemon")
         return self.STATUS_ERROR

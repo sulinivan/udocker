@@ -630,7 +630,7 @@ class ComposeCommandTestCase(TestCase):
         self.assertIn("busybox:latest", out)
         self.assertNotIn("other_web_1", out)
         (status, out, dummy, dummy2, dummy3) = self.run_compose(
-            ["ps", "db", "--file=" + self.path], fake)
+            ["ps", "-a", "db", "--file=" + self.path], fake)
         self.assertEqual(status, 0)
         self.assertNotIn("myproj_web_1", out)
         self.assertIn("myproj_db_1", out)
@@ -673,7 +673,7 @@ class ComposeCommandTestCase(TestCase):
     def test_20_config(self):
         """Test20 config prints the normalized project as JSON"""
         (status, out, dummy, dummy2, dummy3) = self.run_compose(
-            ["config", "--file=" + self.path])
+            ["config", "--format=json", "--file=" + self.path])
         self.assertEqual(status, 0)
         data = json.loads(out)
         self.assertEqual(data["name"], "myproj")
@@ -814,6 +814,482 @@ class ComposeCommandTestCase(TestCase):
             ["up", "-d", "--wait", "--file=" + path], fake)
         self.assertEqual(status, 0)
         self.assertIn("project waitproj is up", out)
+    def test_24_option_surface(self):
+        """Test24 every docker compose option of the census is recognized"""
+        total = sum(len(table) for table in compose.DOCKER_OPTIONS.values())
+        self.assertEqual(len(compose.DOCKER_OPTIONS), 36)
+        self.assertEqual(total, 232)
+        for (page, table) in compose.DOCKER_OPTIONS.items():
+            for flag in table:
+                self.assertEqual(compose.canonical_option(page, flag), flag)
+        self.assertEqual(compose.canonical_option("up", "-d"), "--detach")
+        self.assertEqual(compose.canonical_option("logs", "-f"), "--follow")
+        self.assertEqual(compose.canonical_option("version", "-f"),
+                         "--format")
+        self.assertIsNone(compose.canonical_option("up", "--bogus"))
+
+    def test_25_global_options_override_files(self):
+        """Test25 globals come before the command and -f files merge"""
+        base = write_compose(self.base, COMPOSE_TEXT, "base.yaml")
+        extra = os.path.join(self.base, "override.yaml")
+        with open(extra, "w") as filep:
+            filep.write("services:\n"
+                        "  web:\n"
+                        "    environment:\n"
+                        "      - C=3\n"
+                        "      - A=override\n")
+        (status, out, errors, dummy, dummy2) = self.run_compose(
+            ["-p", "Renamed", "-f", base, "-f", extra, "config",
+             "--format=json"])
+        self.assertEqual(status, 0, errors)
+        data = json.loads(out)
+        self.assertEqual(data["name"], "renamed")
+        environment = data["services"]["web"]["environment"]
+        self.assertIn("C=3", environment)
+        self.assertIn("A=override", environment)
+        self.assertIn("B=two", environment)
+
+    def test_26_profiles_and_project_directory(self):
+        """Test26 --profile filters services, --project-directory sets paths"""
+        text = ("name: prof\n"
+                "services:\n"
+                "  app:\n"
+                "    image: busybox:latest\n"
+                "    volumes: [\"./data:/data\"]\n"
+                "  debug:\n"
+                "    image: busybox:latest\n"
+                "    profiles: [debug]\n")
+        path = write_compose(self.base, text, "profiles.yaml")
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["config", "--services", "--file=" + path])
+        self.assertEqual(status, 0)
+        self.assertEqual(out.split(), ["app"])
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["--profile", "debug", "config", "--services",
+             "--file=" + path])
+        self.assertEqual(status, 0)
+        self.assertEqual(out.split(), ["app", "debug"])
+        alt = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, alt)
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["--project-directory", alt, "config", "--format=json",
+             "--file=" + path])
+        self.assertEqual(status, 0)
+        data = json.loads(out)
+        self.assertEqual(data["services"]["app"]["volumes"],
+                         [os.path.join(alt, "data") + ":/data"])
+
+    def test_27_dry_run(self):
+        """Test27 --dry-run prints the command and runs no child process"""
+        fake = FakeUdocker()
+        (status, out, errors, fake, dummy) = self.run_compose(
+            ["up", "-d", "--dry-run", "--file=" + self.path], fake)
+        self.assertEqual(status, 0)
+        self.assertIn("Dry run:", out)
+        self.assertEqual(fake.calls, [])
+
+    def test_28_explicit_unsupported(self):
+        """Test28 root-only and not applicable options fail explicitly"""
+        (status, dummy, errors, dummy2, dummy3) = self.run_compose(
+            ["exec", "--privileged", "--file=" + self.path, "web", "true"])
+        self.assertEqual(status, 1)
+        self.assertIn("requires root privileges", errors)
+        self.assertIn("--privileged", errors)
+        (status, dummy, errors, dummy2, dummy3) = self.run_compose(
+            ["up", "--scale", "web=2", "--file=" + self.path])
+        self.assertEqual(status, 1)
+        self.assertIn("not applicable to rootless udocker", errors)
+        self.assertIn("multi-replica", errors)
+        (status, dummy, errors, dummy2, dummy3) = self.run_compose(["scale"])
+        self.assertEqual(status, 1)
+        self.assertIn("not applicable to rootless udocker", errors)
+        (status, dummy, errors, dummy2, dummy3) = self.run_compose(
+            ["up", "--abort-on-container-exit", "--file=" + self.path])
+        self.assertEqual(status, 1)
+        self.assertIn("not applicable to rootless udocker", errors)
+
+    def test_29_ps_options(self):
+        """Test29 ps -a, -q, --services, --status and --format json"""
+        containers = [
+            {"name": "myproj_web_1", "status": "running",
+             "image": "busybox:latest"},
+            {"name": "myproj_db_1", "status": "exited",
+             "image": "busybox:latest"},
+            {"name": "myproj_old_1", "status": "running", "image": "x:1"},
+            {"name": "other_web_1", "status": "running", "image": "y:1"},
+        ]
+        fake = FakeUdocker(containers=containers)
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["ps", "--file=" + self.path], fake)
+        self.assertEqual(status, 0)
+        self.assertIn("myproj_web_1", out)
+        self.assertIn("myproj_old_1", out)
+        self.assertNotIn("myproj_db_1", out)
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["ps", "-a", "--status", "exited", "--file=" + self.path], fake)
+        self.assertIn("myproj_db_1", out)
+        self.assertNotIn("myproj_web_1", out)
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["ps", "-q", "--file=" + self.path], fake)
+        self.assertEqual(sorted(out.split()),
+                         ["myproj_old_1", "myproj_web_1"])
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["ps", "--services", "--file=" + self.path], fake)
+        self.assertEqual(out.split(), ["old", "web"])
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["ps", "--format", "json", "--file=" + self.path], fake)
+        data = json.loads(out)
+        self.assertEqual(sorted(row["Name"] for row in data),
+                         ["myproj_old_1", "myproj_web_1"])
+
+    def test_30_down_timeout_and_services(self):
+        """Test30 down -t sets the stop timeout and honours services"""
+        containers = [
+            {"name": "myproj_web_1", "status": "running",
+             "image": "busybox:latest"},
+            {"name": "myproj_db_1", "status": "running",
+             "image": "busybox:latest"},
+        ]
+        fake = FakeUdocker(containers=containers)
+        (status, dummy, dummy2, fake, dummy3) = self.run_compose(
+            ["down", "-t", "3", "web", "--file=" + self.path], fake)
+        self.assertEqual(status, 0)
+        commands = fake.commands()
+        self.assertIn(["stop", "--time=3", "myproj_web_1"], commands)
+        self.assertNotIn(["stop", "--time=3", "myproj_db_1"], commands)
+
+    def test_31_create_and_no_start(self):
+        """Test31 create and up --no-start create without starting"""
+        fake = FakeUdocker()
+        (status, out, errors, fake, dummy) = self.run_compose(
+            ["create", "--file=" + self.path], fake)
+        self.assertEqual(status, 0, errors)
+        commands = fake.commands()
+        self.assertEqual(commands[0], ["ps", "-a", "--format=json"])
+        names = [command[1] for command in commands if command[0] == "create"]
+        self.assertEqual(names, ["--name=myproj_db_1",
+                                 "--name=myproj_web_1"])
+        self.assertFalse([command for command in commands
+                          if command[0] == "run"])
+        fake = FakeUdocker()
+        (status, out, errors, fake, dummy) = self.run_compose(
+            ["up", "--no-start", "--file=" + self.path], fake)
+        self.assertEqual(status, 0, errors)
+        self.assertNotIn("attached to the project logs", out)
+        self.assertFalse([command for command in fake.commands()
+                          if command[0] == "run"])
+
+    def test_32_build_args_and_pull_policy(self):
+        """Test32 build --build-arg is forwarded and pull --policy=always"""
+        text = ("name: bproj\n"
+                "services:\n"
+                "  app:\n"
+                "    build: ./app\n")
+        path = write_compose(self.base, text, "build.yaml")
+        fake = FakeUdocker()
+        (status, dummy, errors, fake, dummy2) = self.run_compose(
+            ["build", "--build-arg", "A=1", "--build-arg", "B=2",
+             "--file=" + path], fake)
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(fake.commands()[0],
+                         ["build", "-t=bproj_app:latest", "--force",
+                          "--build-arg=A=1", "--build-arg=B=2",
+                          os.path.join(self.base, "app")])
+        fake = FakeUdocker()
+        (status, dummy, errors, fake, dummy2) = self.run_compose(
+            ["pull", "--policy", "always", "--file=" + path], fake)
+        self.assertEqual(status, 0, errors)
+        self.assertIn(["pull", "bproj_app:latest"], fake.commands())
+
+    def test_33_run_oneoff(self):
+        """Test33 run forwards its options and stops parsing at the service"""
+        fake = FakeUdocker()
+        (status, dummy, errors, fake, dummy2) = self.run_compose(
+            ["run", "--rm", "-e", "A=1", "-v", "/tmp/x:/y",
+             "--service-ports", "--file=" + self.path, "web", "sh", "-c",
+             "echo hi"], fake)
+        self.assertEqual(status, 0, errors)
+        runs = [command for command in fake.commands()
+                if command[0] == "run" and command[-1] == "echo hi"]
+        self.assertEqual(len(runs), 1)
+        command = runs[0]
+        self.assertIn("--rm", command)
+        self.assertIn("--env=A=1", command)
+        self.assertIn("--volume=/tmp/x:/y", command)
+        self.assertIn("--publish=8080:80", command)
+        self.assertEqual(command[-4:], ["busybox:latest", "sh", "-c",
+                                        "echo hi"])
+
+    def test_34_exec_options(self):
+        """Test34 exec forwards options and the command after the service"""
+        containers = [{"name": "myproj_web_1", "status": "running",
+                       "image": "busybox:latest"}]
+        fake = FakeUdocker(containers=containers)
+        (status, dummy, errors, fake, dummy2) = self.run_compose(
+            ["exec", "-T", "-e", "A=1", "-u", "app", "-w", "/app",
+             "--file=" + self.path, "web", "sh", "-c", "echo hi"], fake)
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(fake.commands()[0],
+                         ["exec", "--env=A=1", "--user=app",
+                          "--workdir=/app", "myproj_web_1", "sh", "-c",
+                          "echo hi"])
+
+    def test_35_lifecycle_delegation(self):
+        """Test35 start/stop/restart/kill/pause/unpause/rm wait top port cp"""
+        containers = [
+            {"name": "myproj_web_1", "status": "running", "image": "b:1"},
+            {"name": "myproj_db_1", "status": "exited", "image": "b:1"},
+        ]
+        fake = FakeUdocker(containers=containers)
+        cases = [
+            (["start", "--file=" + self.path], ["start", "myproj_db_1"]),
+            (["stop", "--timeout", "2", "--file=" + self.path],
+             ["stop", "--time=2", "myproj_web_1"]),
+            (["restart", "--file=" + self.path],
+             ["restart", "myproj_web_1"]),
+            (["kill", "-s", "SIGTERM", "--file=" + self.path],
+             ["kill", "--signal=SIGTERM", "myproj_web_1"]),
+            (["pause", "web", "--file=" + self.path],
+             ["pause", "myproj_web_1"]),
+            (["unpause", "web", "--file=" + self.path],
+             ["unpause", "myproj_web_1"]),
+            (["rm", "-f", "web", "--file=" + self.path],
+             ["rm", "-f", "myproj_web_1"]),
+            (["wait", "db", "--file=" + self.path],
+             ["wait", "myproj_db_1"]),
+            (["top", "web", "--file=" + self.path],
+             ["top", "myproj_web_1"]),
+            (["port", "web", "80", "--file=" + self.path],
+             ["port", "myproj_web_1", "80"]),
+            (["cp", "web:/x", "/tmp/y", "--file=" + self.path],
+             ["cp", "myproj_web_1:/x", "/tmp/y"]),
+            (["commit", "web", "repo/img:1", "--file=" + self.path],
+             ["commit", "myproj_web_1", "repo/img:1"]),
+            (["export", "-o", "/tmp/x.tar", "web", "--file=" + self.path],
+             ["export", "-o", "/tmp/x.tar", "myproj_web_1"]),
+        ]
+        for (args, expected) in cases:
+            (status, dummy, errors, fake, dummy2) = self.run_compose(
+                args, fake)
+            self.assertEqual(status, 0, "%s: %s" % (args, errors))
+            self.assertIn(expected, fake.commands())
+
+    def test_36_events_images_ls(self):
+        """Test36 events delegation, images and ls output"""
+        containers = [
+            {"name": "myproj_web_1", "status": "running", "image": "b:1"},
+            {"name": "other_web_1", "status": "running", "image": "c:1"},
+        ]
+        fake = FakeUdocker(containers=containers)
+        (status, dummy, errors, fake, dummy2) = self.run_compose(
+            ["events", "--json", "--since", "1h", "--until", "1s",
+             "--file=" + self.path], fake)
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(fake.commands()[0],
+                         ["events", "--since=1h", "--until=1s",
+                          "--format=json",
+                          "--filter=container=myproj_web_1",
+                          "--filter=container=myproj_db_1"])
+        (status, out, errors, fake, dummy2) = self.run_compose(
+            ["images", "--file=" + self.path], fake)
+        self.assertEqual(status, 0)
+        self.assertIn("myproj_web_1", out)
+        self.assertIn("b:1", out)
+        (status, out, errors, fake, dummy2) = self.run_compose(
+            ["ls", "-a", "-q", "--file=" + self.path], fake)
+        self.assertEqual(sorted(out.split()), ["myproj", "other"])
+        (status, out, errors, fake, dummy2) = self.run_compose(
+            ["ls", "--format", "json", "--file=" + self.path], fake)
+        self.assertEqual(sorted(row["Name"] for row in json.loads(out)),
+                         ["myproj", "other"])
+
+    def test_37_volumes_existing(self):
+        """Test37 volumes lists the named volumes that exist"""
+        text = ("name: myproj\n"
+                "services:\n"
+                "  web:\n"
+                "    image: busybox:latest\n"
+                "    volumes: [\"data:/data\"]\n"
+                "volumes:\n"
+                "  data: {}\n")
+        path = write_compose(self.base, text, "vol.yaml")
+        os.makedirs(os.path.join(self.base, "volumes", "myproj_data",
+                                 "_data"))
+        with patch.dict(Config.conf, {"topdir": self.base}):
+            (status, out, dummy, dummy2, dummy3) = self.run_compose(
+                ["volumes", "-q", "--file=" + path])
+        self.assertEqual(status, 0)
+        self.assertEqual(out.split(), ["myproj_data"])
+
+    def test_38_version(self):
+        """Test38 version pretty, --short and --format json"""
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(["version"])
+        self.assertEqual(status, 0)
+        self.assertEqual(out.strip(), "Docker Compose version v5.7.0")
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["version", "--short"])
+        self.assertEqual(out.strip(), "5.7.0")
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["version", "--format=json"])
+        self.assertEqual(json.loads(out), {"version": "v5.7.0"})
+
+    def test_39_config_outputs(self):
+        """Test39 config selectors, hash, file output and default YAML"""
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["config", "--services", "--file=" + self.path])
+        self.assertEqual(out.split(), ["web", "db"])
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["config", "--images", "--file=" + self.path])
+        self.assertEqual(out.split(), ["busybox:latest", "busybox:latest"])
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["config", "--hash", "*", "--file=" + self.path])
+        fields = out.split()
+        self.assertEqual(fields[0], "web")
+        self.assertEqual(len(fields[1]), 64)
+        (status, out, errors, dummy, dummy2) = self.run_compose(
+            ["config", "--format=json", "--quiet", "--file=" + self.path])
+        self.assertEqual((status, out), (0, ""))
+        target = os.path.join(self.base, "config.json")
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["config", "--format=json", "-o", target, "--file=" + self.path])
+        self.assertEqual(status, 0)
+        self.assertTrue(os.path.exists(target))
+        with open(target) as filep:
+            self.assertEqual(json.load(filep)["name"], "myproj")
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["config", "--file=" + self.path])
+        self.assertIn("name: myproj", out)
+        self.assertIn("  web:", out)
+
+    def test_40_config_not_applicable(self):
+        """Test40 not applicable config options and invalid values"""
+        (status, dummy, errors, dummy2, dummy3) = self.run_compose(
+            ["config", "--models", "--file=" + self.path])
+        self.assertEqual(status, 1)
+        self.assertIn("not applicable to rootless udocker", errors)
+        (status, dummy, errors, dummy2, dummy3) = self.run_compose(
+            ["config", "--format=toml", "--file=" + self.path])
+        self.assertEqual(status, 1)
+        self.assertIn("unsupported --format value", errors)
+        (status, dummy, errors, dummy2, dummy3) = self.run_compose(
+            ["up", "--timeout", "abc", "--file=" + self.path])
+        self.assertEqual(status, 1)
+        self.assertIn("invalid --timeout value", errors)
+
+    def test_41_env_file_and_interpolation(self):
+        """Test41 --env-file feeds the interpolation, --no-interpolate off"""
+        envfile = os.path.join(self.base, "probe.env")
+        with open(envfile, "w") as filep:
+            filep.write("PROBE_TAG=fromfile\n")
+        text = ("name: envproj\n"
+                "services:\n"
+                "  app:\n"
+                "    image: \"busybox:${PROBE_TAG}\"\n")
+        path = write_compose(self.base, text, "env.yaml")
+        os.environ.pop("PROBE_TAG", None)
+        self.addCleanup(os.environ.pop, "PROBE_TAG", None)
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["--env-file", envfile, "config", "--format=json",
+             "--file=" + path])
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(out)["services"]["app"]["image"],
+                         "busybox:fromfile")
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["config", "--no-interpolate", "--format=json",
+             "--file=" + path])
+        self.assertEqual(json.loads(out)["services"]["app"]["image"],
+                         "busybox:${PROBE_TAG}")
+
+    def test_42_no_env_resolution_and_paths(self):
+        """Test42 --no-env-resolution and --no-path-resolution keep values"""
+        with open(os.path.join(self.base, "service.env"), "w") as filep:
+            filep.write("FROM_FILE=1\n")
+        text = ("name: rproj\n"
+                "services:\n"
+                "  app:\n"
+                "    image: busybox:latest\n"
+                "    env_file: ./service.env\n"
+                "    environment: [\"A=1\"]\n"
+                "    volumes: [\"./data:/data\"]\n")
+        path = write_compose(self.base, text, "res.yaml")
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["config", "--no-env-resolution", "--no-path-resolution",
+             "--format=json", "--file=" + path])
+        self.assertEqual(status, 0)
+        plan = json.loads(out)["services"]["app"]
+        self.assertEqual(plan["environment"], ["A=1"])
+        self.assertEqual(plan["volumes"], ["./data:/data"])
+
+    def test_43_up_attach_filter(self):
+        """Test43 up --attach limits the followed logs"""
+        with patch.object(compose, "stream_logs") as mock_logs:
+            (status, dummy, errors, fake, dummy2) = self.run_compose(
+                ["up", "--attach", "db", "--file=" + self.path])
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(mock_logs.call_args[0][0], ["myproj_db_1"])
+        stops = [command for command in fake.commands()
+                 if command[0] == "stop"]
+        self.assertEqual(sorted(command[1] for command in stops),
+                         ["myproj_db_1", "myproj_web_1"])
+
+    def test_44_bool_option_values(self):
+        """Test44 --option=false turns a boolean flag off"""
+        containers = [{"name": "myproj_db_1", "status": "exited",
+                       "image": "busybox:latest"}]
+        fake = FakeUdocker(containers=containers)
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["ps", "--file=" + self.path], fake)
+        self.assertNotIn("myproj_db_1", out)
+        (status, out, dummy, dummy2, dummy3) = self.run_compose(
+            ["ps", "--all=true", "--file=" + self.path], fake)
+        self.assertIn("myproj_db_1", out)
+
+    def test_45_up_profiles(self):
+        """Test45 up starts the services of the enabled profiles only"""
+        text = ("name: pj\n"
+                "services:\n"
+                "  app:\n"
+                "    image: busybox:latest\n"
+                "    command: sleep 5\n"
+                "  debug:\n"
+                "    image: busybox:latest\n"
+                "    profiles: [debug]\n"
+                "    command: sleep 5\n")
+        path = write_compose(self.base, text, "pup.yaml")
+        fake = FakeUdocker()
+        (status, dummy, errors, fake, dummy2) = self.run_compose(
+            ["up", "-d", "--file=" + path], fake)
+        self.assertEqual(status, 0, errors)
+        names = [command[1] for command in fake.commands()
+                 if command[0] == "create"]
+        self.assertEqual(names, ["--name=pj_app_1"])
+        fake = FakeUdocker()
+        (status, dummy, errors, fake, dummy2) = self.run_compose(
+            ["--profile", "debug", "up", "-d", "--file=" + path], fake)
+        self.assertEqual(status, 0, errors)
+        names = [command[1] for command in fake.commands()
+                 if command[0] == "create"]
+        self.assertEqual(names, ["--name=pj_app_1", "--name=pj_debug_1"])
+
+    def test_46_logs_time_options(self):
+        """Test46 logs --since/--until/--timestamps are forwarded"""
+        fake = FakeUdocker(logs={"myproj_web_1": "line\n"})
+        (status, out, errors, fake, dummy) = self.run_compose(
+            ["logs", "--since", "1h", "--until", "1s", "--timestamps",
+             "web", "--file=" + self.path], fake)
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(fake.commands()[0],
+                         ["logs", "--since=1h", "--until=1s",
+                          "--timestamps", "myproj_web_1"])
+
+    def test_47_up_timestamps_follow(self):
+        """Test47 up --timestamps is forwarded to the followed logs"""
+        with patch.object(compose, "stream_logs") as mock_logs:
+            (status, dummy, errors, dummy2, dummy3) = self.run_compose(
+                ["up", "--timestamps", "--file=" + self.path])
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(mock_logs.call_args[1]["extra"], ["--timestamps"])
+
 
 if __name__ == '__main__':
     main()

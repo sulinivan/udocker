@@ -11,9 +11,11 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import json
 import re
+from datetime import datetime, timezone
 
 from udocker.msg import Msg
 from udocker.config import Config
@@ -24,6 +26,7 @@ from udocker.utils.containerpath import container_realpath
 STATE_NAME = "state.json"
 CONF_NAME = "supervisor.json"
 LOG_NAME = os.path.join("logs", "container.log")
+TS_LOG_NAME = os.path.join("logs", "container.ts")
 STOPPING_NAME = "stopping"
 HEALTH_NAME = "health.json"
 HEALTH_CONFIG_NAME = "health-config.json"
@@ -538,9 +541,61 @@ def wait(container_dir, timeout=None):
     return state.get("exitcode")
 
 
-def logs(container_dir, follow=False, tail=None):
+def ts_log_path(container_dir):
+    """Return the path of the timestamped container log sidecar"""
+    return os.path.join(container_dir, TS_LOG_NAME)
+
+
+def _stamp_epoch(line):
+    """Epoch of a 'RFC3339 line' record, None when it does not parse."""
+    stamp, separator, _ = line.partition(b" ")
+    if not separator:
+        return None
+    text = stamp.decode("ascii", "replace").strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
+
+
+def _strip_stamp(line):
+    """Drop the RFC3339 prefix of a timestamped log record"""
+    _, separator, rest = line.partition(b" ")
+    return rest if separator else line
+
+
+def _select(content, since, until, timestamps):
+    """Filter timestamped log records by time, optionally keep the stamp."""
+    if since is None and until is None and not timestamps:
+        return content
+    selected = []
+    for line in content.splitlines(True):
+        epoch = _stamp_epoch(line)
+        if epoch is None:
+            selected.append(line)
+            continue
+        if since is not None and epoch < since:
+            continue
+        if until is not None and epoch > until:
+            continue
+        selected.append(line if timestamps else _strip_stamp(line))
+    return b"".join(selected)
+
+
+def logs(container_dir, follow=False, tail=None, since=None, until=None,
+         timestamps=False):
     """Print the container stdout/stderr log"""
-    path = log_path(container_dir)
+    stamped = since is not None or until is not None or timestamps
+    path = ts_log_path(container_dir) if stamped else log_path(container_dir)
+    if (stamped and not os.path.exists(path) and
+            os.path.exists(log_path(container_dir))):
+        Msg().out("Warning: no timestamps recorded for this container,"
+                  " showing the log without them", l=Msg.WAR)
+        path = log_path(container_dir)
+        since = until = None
+        timestamps = False
     try:
         filep = open(path, "rb")
     except (IOError, OSError):
@@ -549,6 +604,7 @@ def logs(container_dir, follow=False, tail=None):
     try:
         content = filep.read()
         offset = len(content)
+        content = _select(content, since, until, timestamps)
         if tail:
             lines = content.splitlines(True)
             content = b"".join(lines[-int(tail):])
@@ -561,12 +617,88 @@ def logs(container_dir, follow=False, tail=None):
                 filep.seek(offset)
                 data = filep.read()
                 offset += len(data)
-                _write_bytes(data)
+                _write_bytes(_select(data, since, until, timestamps))
             if not is_running(container_dir) and FileSize(path) <= offset:
                 return 0
             time.sleep(0.2)
     finally:
         filep.close()
+
+
+class LogTee(object):
+    """Record docker style per-line timestamps for a detached container.
+
+    The monitor process inherits the raw log file as stdout/stderr, so the
+    timestamps cannot be recovered afterwards.  In monitor mode the fds are
+    redirected into a pipe and a thread copies every chunk to the raw log
+    plus a timestamped sidecar log that `logs --since/--until/--timestamps`
+    reads.
+    """
+
+    def __init__(self, container_dir):
+        self.container_dir = container_dir
+        self.read_fd = None
+        self.saved_fd = None
+        self.thread = None
+
+    def start(self):
+        """Redirect stdout/stderr through the timestamping relay"""
+        if not isinstance(self.container_dir, str):
+            return False
+        try:
+            self.saved_fd = os.dup(1)
+            read_fd, write_fd = os.pipe()
+            os.dup2(write_fd, 1)
+            os.dup2(write_fd, 2)
+            os.close(write_fd)
+        except OSError:
+            return False
+        self.read_fd = read_fd
+        self.thread = threading.Thread(target=self._relay, daemon=True)
+        self.thread.start()
+        return True
+
+    def _relay(self):
+        """Copy the pipe to the raw log and to the timestamped sidecar"""
+        stamped = None
+        try:
+            stamped = open(ts_log_path(self.container_dir), "ab")
+        except (IOError, OSError):
+            stamped = None
+        pending = b""
+        while True:
+            try:
+                chunk = os.read(self.read_fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            try:
+                os.write(self.saved_fd, chunk)
+            except OSError:
+                pass
+            if stamped is None:
+                continue
+            pending += chunk
+            lines = pending.split(b"\n")
+            pending = lines.pop()
+            for line in lines:
+                self._write_stamp(stamped, line)
+        if pending and stamped is not None:
+            self._write_stamp(stamped, pending)
+        if stamped is not None:
+            stamped.close()
+
+    @staticmethod
+    def _write_stamp(handle, line):
+        """Write one timestamped record"""
+        stamp = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.%fZ").encode("ascii")
+        try:
+            handle.write(stamp + b" " + line + b"\n")
+            handle.flush()
+        except (IOError, OSError, ValueError):
+            pass
 
 
 def FileSize(path):
