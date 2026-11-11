@@ -498,5 +498,23 @@ class DockerCompatOutputTestCase(TestCase):
                 patch('udocker.cli.Msg'):
             self.assertEqual(cli.do_exec(cmdp), 1)
 
+    def test_16_completion(self):
+        """Test16 completion prints bash/zsh/fish scripts"""
+        cli = self._cli(Mock())
+        for (shell, marker) in (("bash", "_udocker"),
+                                ("zsh", "#compdef udocker"),
+                                ("fish", "complete -c udocker")):
+            cmdp = CmdParser()
+            cmdp.parse(["udocker", "completion", shell])
+            with patch('udocker.cli.Msg') as mock_msg:
+                self.assertEqual(cli.do_completion(cmdp), 0)
+            out = mock_msg.return_value.out.call_args[0][0]
+            self.assertIn(marker, out)
+            self.assertIn("exec", out)
+        cmdp = CmdParser()
+        cmdp.parse(["udocker", "completion", "tcsh"])
+        with patch('udocker.cli.Msg'):
+            self.assertEqual(cli.do_completion(cmdp), 1)
+
 if __name__ == '__main__':
     main()

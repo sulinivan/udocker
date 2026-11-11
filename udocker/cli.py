@@ -4133,6 +4133,53 @@ class UdockerCLI(object):
         except KeyboardInterrupt:
             return self.STATUS_OK
 
+    COMPLETION_COMMANDS = (
+        "search pull push create run ps images rmi tag history inspect "
+        "manifest verify build commit cp diff top stats port system image "
+        "prune compose volume network events pause unpause logs exec start "
+        "stop restart kill wait rm name rmname rename clone save load "
+        "import export setup install version showconf help completion "
+        "container image volume network system")
+
+    def do_completion(self, cmdp):
+        """
+        completion: print a shell completion script
+        completion bash|zsh|fish
+        """
+        shell = cmdp.get("P1")
+        if cmdp.missing_options():
+            return self.STATUS_ERROR
+        commands = " ".join(self.COMPLETION_COMMANDS.split())
+        groups = "container image volume network system compose"
+        if shell == "bash":
+            Msg().out(
+                "_udocker() {\n"
+                "    local cur=\"${COMP_WORDS[COMP_CWORD]}\"\n"
+                "    if [ \"$COMP_CWORD\" -eq 1 ]; then\n"
+                "        COMPREPLY=( $(compgen -W \"%s\" -- \"$cur\") )\n"
+                "    else\n"
+                "        COMPREPLY=( $(compgen -W \"%s --help\" -- "
+                "\"$cur\") )\n"
+                "    fi\n"
+                "}\n"
+                "complete -F _udocker udocker\n" % (commands, groups))
+            return self.STATUS_OK
+        if shell == "zsh":
+            Msg().out(
+                "#compdef udocker\n"
+                "_udocker() {\n"
+                "    local -a commands\n"
+                "    commands=(%s)\n"
+                "    _describe 'command' commands\n"
+                "}\n"
+                "compdef _udocker udocker\n" % commands)
+            return self.STATUS_OK
+        if shell == "fish":
+            Msg().out("complete -c udocker -f -a \"%s\"" % commands)
+            return self.STATUS_OK
+        Msg().err("Error: completion requires bash, zsh or fish")
+        return self.STATUS_ERROR
+
     def do_update(self, cmdp):
         """
         update: change container resource limits
@@ -4188,6 +4235,7 @@ Docker-style command groups are accepted and translated:
   stop <container>              :Stop a running container
   restart <container>           :Stop and start a container
   events [--since=] [--until=]:Stream container events as JSON
+  completion bash|zsh|fish     :Print a shell completion script
   update <container>            :not available without root (cgroups)
   pause <container>             :Pause all processes of a container
   unpause <container>           :Resume a paused container

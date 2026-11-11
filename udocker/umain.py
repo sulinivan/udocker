@@ -182,6 +182,7 @@ class UMain(object):
             "network": self.cli.do_network, "events": self.cli.do_events,
             "update": self.cli.do_update,
             "container-prune": self.cli.do_container_prune,
+            "completion": self.cli.do_completion,
             "pause": self.cli.do_pause, "unpause": self.cli.do_unpause,
         }
 
