@@ -178,7 +178,7 @@ class UMain(object):
             "system": self.cli.do_system, "image": self.cli.do_image,
             "prune": self.cli.do_prune, "compose": self.cli.do_compose,
             "volume": self.cli.do_volume, "info": self.cli.do_info,
-            "network": self.cli.do_network,
+            "network": self.cli.do_network, "events": self.cli.do_events,
             "pause": self.cli.do_pause, "unpause": self.cli.do_unpause,
         }
 

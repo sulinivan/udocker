@@ -16,6 +16,7 @@ from udocker.cmdparser import CmdParser
 from udocker.config import Config
 from udocker import supervisor
 from udocker.umain import expand_compat_argv
+from udocker.cli import _parse_time_arg
 
 
 class DockerCompatArgvTestCase(TestCase):
@@ -357,6 +358,51 @@ class DockerCompatOutputTestCase(TestCase):
         self.assertFalse(cli._restart_requested("always", 3, container_dir))
         supervisor.clear_stopped(container_dir)
 
+
+    def test_11_events(self):
+        """Test11 event records, snapshot diff and filters"""
+        cli = self._cli(Mock())
+        record = cli._event_record(
+            "start", {"id": "c1", "image": "busybox:latest", "name": "web"},
+            1000)
+        self.assertEqual(record["Type"], "container")
+        self.assertEqual(record["Action"], "start")
+        self.assertEqual(record["Actor"]["ID"], "c1")
+        self.assertEqual(record["Actor"]["Attributes"]["name"], "web")
+        self.assertEqual(record["time"], 1000)
+        old = {}
+        new = {"c1": {"id": "c1", "status": "running",
+                      "image": "i", "name": "n"}}
+        diff = cli._event_diff(old, new)
+        self.assertEqual([item[0] for item in diff], ["create", "start"])
+        paused = {"c1": {"id": "c1", "status": "paused",
+                         "image": "i", "name": "n"}}
+        self.assertEqual([item[0] for item in cli._event_diff(new, paused)],
+                         ["pause"])
+        self.assertEqual([item[0] for item in cli._event_diff(paused, new)],
+                         ["unpause"])
+        exited = {"c1": {"id": "c1", "status": "exited",
+                         "image": "i", "name": "n"}}
+        self.assertEqual([item[0] for item in cli._event_diff(new, exited)],
+                         ["die"])
+        self.assertEqual([item[0] for item in cli._event_diff(new, {})],
+                         ["destroy"])
+        self.assertTrue(cli._event_matches(
+            "start", {"id": "c1", "name": "web", "image": "i"},
+            ["type=container", "action=start"]))
+        self.assertFalse(cli._event_matches(
+            "die", {"id": "c1", "name": "web", "image": "i"},
+            ["event=start"]))
+        self.assertTrue(cli._event_matches(
+            "die", {"id": "c1", "name": "web", "image": "i"},
+            ["container=c1"]))
+        import time as time_module
+        self.assertAlmostEqual(_parse_time_arg("10m"),
+                               time_module.time() - 600, delta=5)
+        self.assertAlmostEqual(_parse_time_arg("1h30m"),
+                               time_module.time() - 5400, delta=5)
+        self.assertIsNotNone(_parse_time_arg("2026-11-10T10:00:00Z"))
+        self.assertIsNone(_parse_time_arg("bad"))
 
 if __name__ == '__main__':
     main()

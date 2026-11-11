@@ -91,6 +91,30 @@ def _container_labels(container_dir):
     return labels if isinstance(labels, dict) else {}
 
 
+def _parse_time_arg(value):
+    """--since/--until: unix or ISO timestamp, or a duration like 10m/1h30m"""
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if text.isdigit():
+        return float(text)
+    epoch = _parse_timestamp(text)
+    if epoch is not None:
+        return epoch
+    units = {"s": 1, "m": 60, "h": 3600}
+    total = 0
+    index = 0
+    while index < len(text):
+        start = index
+        while index < len(text) and text[index].isdigit():
+            index += 1
+        if start == index or index >= len(text) or text[index] not in units:
+            return None
+        total += int(text[start:index]) * units[text[index]]
+        index += 1
+    return time.time() - total
+
+
 def _read_state(container_dir):
     """Container state.json as a dict, empty when missing or invalid"""
     if not isinstance(container_dir, (str, bytes)):
@@ -3671,6 +3695,9 @@ class UdockerCLI(object):
             "Engine": {"Name": "udocker"},
         }
         data = {"Client": client, "Server": server}
+        if template in ("json",):
+            Msg().out(json.dumps(data, sort_keys=True, indent=4))
+            return self.STATUS_OK
         if template:
             Msg().out(render_template(template, data))
             return self.STATUS_OK
@@ -3727,6 +3754,9 @@ class UdockerCLI(object):
             "Registry": str(Config.conf['dockerio_registry_url']),
             "UdockerTarball": str(Config.conf['tarball_release']),
         }
+        if template in ("json",):
+            Msg().out(json.dumps(data, sort_keys=True, indent=4))
+            return self.STATUS_OK
         if template:
             Msg().out(render_template(template, data))
             return self.STATUS_OK
@@ -3757,6 +3787,157 @@ class UdockerCLI(object):
         Msg().out(" Volumes:          %s" % data["Volumes"])
         Msg().out(" Registry:         %s" % data["Registry"])
         return self.STATUS_OK
+
+    def _events_snapshot(self):
+        """Status of every container, used to derive events"""
+        snapshot = {}
+        for (container_id, image, names) in \
+                self.localrepo.get_containers_list(False):
+            container_dir = self.localrepo.cd_container(container_id) or ""
+            state = _read_state(container_dir)
+            if isinstance(names, (list, tuple)):
+                name = str(names[0]) if names else ""
+            else:
+                name = str(names or "")
+            snapshot[container_id] = {
+                "id": container_id,
+                "status": state.get("status", ""),
+                "timestamp": state.get("timestamp", ""),
+                "name": name,
+                "image": image or "",
+            }
+        return snapshot
+
+    @staticmethod
+    def _event_record(action, container, epoch):
+        """Docker events JSON record"""
+        attributes = {"image": container.get("image", ""),
+                      "name": container.get("name", "")}
+        return {
+            "status": action,
+            "id": container.get("id", ""),
+            "from": container.get("image", ""),
+            "Type": "container",
+            "Action": action,
+            "Actor": {"ID": container.get("id", ""),
+                      "Attributes": attributes},
+            "scope": "local",
+            "time": int(epoch),
+            "timeNano": int(epoch * 1000000000),
+        }
+
+    @staticmethod
+    def _event_diff(old, new):
+        """Events implied by moving from one snapshot to the next"""
+        events = []
+        for (container_id, item) in new.items():
+            previous = old.get(container_id)
+            if previous is None:
+                events.append(("create", container_id, item))
+                if item["status"] == "running":
+                    events.append(("start", container_id, item))
+                continue
+            if previous["status"] == item["status"]:
+                continue
+            status = item["status"]
+            if status == "running":
+                action = ("unpause" if previous["status"] == "paused"
+                          else "start")
+            elif status == "paused":
+                action = "pause"
+            elif status in ("exited", "interrupted"):
+                action = "die"
+            else:
+                action = ""
+            if action:
+                events.append((action, container_id, item))
+        for (container_id, item) in old.items():
+            if container_id not in new:
+                events.append(("destroy", container_id, item))
+        return events
+
+    def _event_matches(self, action, container, filters):
+        """Apply docker events --filter items to one event"""
+        for entry in filters:
+            (key, separator, value) = str(entry).partition("=")
+            if not separator:
+                return False
+            values = [item for item in value.split(",") if item]
+            if key in ("event", "action"):
+                if action not in values:
+                    return False
+            elif key == "container":
+                if not any(item in container.get("id", "") or
+                           item == container.get("name") for item in values):
+                    return False
+            elif key == "image":
+                if not any(item in container.get("image", "")
+                           for item in values):
+                    return False
+            elif key == "type":
+                if "container" not in values:
+                    return False
+            else:
+                return False
+        return True
+
+    def _emit_event(self, action, epoch, container, template, filters):
+        """Print one event when it passes the filters"""
+        if not self._event_matches(action, container, filters):
+            return
+        record = self._event_record(action, container, epoch)
+        if template and template != "json":
+            Msg().out(render_template(template, record))
+        else:
+            Msg().out(json.dumps(record, sort_keys=True))
+        sys.stdout.flush()
+
+    def do_events(self, cmdp):
+        """
+        events: stream container events from the repository state
+        events [options]
+        --since=<time>             :start with events after a time/duration
+        --until=<time>             :stop at a time/duration
+        -f, --filter=<key=value>   :filter by event/container/image/type
+        --format=<template>        :render each event with a Go-template
+        """
+        since_arg = cmdp.get("--since=")
+        until_arg = cmdp.get("--until=")
+        filters = list(cmdp.get("-f=", "CMD_OPT", True))
+        filters.extend(cmdp.get("--filter=", "CMD_OPT", True))
+        template = cmdp.get("--format=")
+        if cmdp.missing_options():               # syntax error
+            return self.STATUS_ERROR
+        since = _parse_time_arg(since_arg)
+        until = _parse_time_arg(until_arg)
+        snapshot = self._events_snapshot()
+        if since is not None:
+            initial = []
+            for (container_id, item) in snapshot.items():
+                epoch = _parse_timestamp(item.get("timestamp", ""))
+                if epoch is None or epoch < since:
+                    continue
+                status = item.get("status", "")
+                action = {"running": "start", "paused": "pause",
+                          "exited": "die", "interrupted": "die"}.get(status)
+                if action:
+                    initial.append((epoch, action, item))
+            for (epoch, action, item) in sorted(initial,
+                                                key=lambda entry: entry[0]):
+                self._emit_event(action, epoch, item, template, filters)
+        try:
+            while True:
+                if until is not None and time.time() >= until:
+                    return self.STATUS_OK
+                time.sleep(0.5)
+                current = self._events_snapshot()
+                for (action, dummy, item) in self._event_diff(snapshot,
+                                                              current):
+                    self._emit_event(action, time.time(), item, template,
+                                     filters)
+                snapshot = current
+        except KeyboardInterrupt:
+            return self.STATUS_OK
 
     def do_help(self, cmdp):
         """
@@ -3800,6 +3981,7 @@ Docker-style command groups are accepted and translated:
   start <container>             :Start a container created with run -d
   stop <container>              :Stop a running container
   restart <container>           :Stop and start a container
+  events [--since=] [--until=]:Stream container events as JSON
   pause <container>             :Pause all processes of a container
   unpause <container>           :Resume a paused container
   kill -s <signal> <container>  :Send a signal to a running container
