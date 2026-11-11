@@ -6,7 +6,7 @@ udocker unit tests: docker Go-template subset
 
 from unittest import TestCase, main
 
-from udocker.utils.gotemplate import render
+from udocker.utils.gotemplate import render, render_table
 
 
 class GoTemplateTestCase(TestCase):
@@ -45,3 +45,21 @@ class GoTemplateTestCase(TestCase):
         self.assertEqual(render("{{.ID", self.data), "{{.ID")
         self.assertEqual(render("", self.data), "")
         self.assertEqual(render(None, self.data), "")
+
+
+class GoTemplateTableTestCase(TestCase):
+    """Table rendering of the docker --format table templates"""
+
+    def test_01_table(self):
+        """Test01 headers, rows, empty list and camel case labels"""
+        records = [{"ID": "abc", "Names": "web"},
+                   {"ID": "def", "Names": "db"}]
+        out = render_table("table {{.ID}}\t{{.Names}}", records)
+        lines = out.splitlines()
+        self.assertEqual(lines[0].split(), ["ID", "NAMES"])
+        self.assertEqual(lines[1].split(), ["abc", "web"])
+        self.assertEqual(lines[2].split(), ["def", "db"])
+        self.assertEqual(render_table("table {{.Names}}", []).split(),
+                         ["NAMES"])
+        camel = render_table("table {{.CreatedAt}}", [{"CreatedAt": "now"}])
+        self.assertEqual(camel.splitlines()[0].split(), ["CREATED", "AT"])

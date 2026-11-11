@@ -404,5 +404,38 @@ class DockerCompatOutputTestCase(TestCase):
         self.assertIsNotNone(_parse_time_arg("2026-11-10T10:00:00Z"))
         self.assertIsNone(_parse_time_arg("bad"))
 
+    def test_12_prune_and_table(self):
+        """Test12 container/image/network prune and table output"""
+        localrepo = Mock()
+        cli = self._cli(localrepo)
+        with patch('udocker.cli.extras.system_prune',
+                   return_value=0) as mock_prune:
+            cmdp = CmdParser()
+            cmdp.parse(["udocker", "container-prune", "-f"])
+            self.assertEqual(cli.do_container_prune(cmdp), 0)
+            mock_prune.assert_called_once_with(localrepo, "containers", True)
+        with patch('udocker.cli.extras.system_prune',
+                   return_value=0) as mock_prune:
+            cmdp = CmdParser()
+            cmdp.parse(["udocker", "image", "prune", "-a", "-f"])
+            self.assertEqual(cli.do_image(cmdp), 0)
+            mock_prune.assert_called_once_with(localrepo, "images", True)
+        cmdp = CmdParser()
+        cmdp.parse(["udocker", "network", "prune", "-f"])
+        with patch('udocker.cli.Msg'):
+            self.assertEqual(cli.do_network(cmdp), 0)
+
+    def test_13_ps_table_format(self):
+        """Test13 ps --format 'table ...' prints docker-like columns"""
+        container_dir = self._container_dir(
+            "tab1", {"status": "running", "pid": os.getpid(),
+                     "timestamp": "2026-11-10T10:00:00Z", "ports": []})
+        localrepo = self._localrepo({"tab1": (container_dir, ["web"])})
+        out = self._run_ps(localrepo, "--format",
+                           "table {{.ID}}\t{{.Names}}")
+        lines = out.splitlines()
+        self.assertEqual(lines[0].split(), ["ID", "NAMES"])
+        self.assertIn("web", lines[1])
+
 if __name__ == '__main__':
     main()

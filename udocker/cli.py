@@ -33,6 +33,7 @@ from udocker.utils.mountpoint import MountPoint
 from udocker.utils.portforward import PortForwarder
 from udocker.utils.containerpath import container_realpath
 from udocker.utils.gotemplate import render as render_template
+from udocker.utils.gotemplate import render_table
 from udocker.utils import ulimits as ulimits_util
 from udocker import supervisor
 from udocker import extras
@@ -1614,10 +1615,11 @@ class UdockerCLI(object):
             raise
         finally:
             ulimits_util.restore(saved_limits)
-        if not isinstance(exit_status, int) or getattr(
-                exec_engine, "exit_code", 0) == 127:
-            exit_status = 127 if getattr(
-                exec_engine, "exit_code", 0) == 127 else 1
+        engine_code = getattr(exec_engine, "exit_code", 0)
+        if engine_code in (126, 127):
+            exit_status = engine_code
+        elif not isinstance(exit_status, int):
+            exit_status = 1
         if forwarder:
             forwarder.stop()
         self._write_state(container_dir, "exited", exitcode=exit_status)
@@ -2099,7 +2101,11 @@ class UdockerCLI(object):
         """
         subcmd = cmdp.get("P1")
         if subcmd == "prune":
-            force = self._prune_force(cmdp)
+            args = cmdp.get("P*") or []
+            if args and args[0] == subcmd:
+                args = args[1:]
+            force = "-f" in args or "--force" in args
+            dummy = "-a" in args or "--all" in args
             if cmdp.missing_options():
                 return self.STATUS_ERROR
             return extras.system_prune(self.localrepo, "images", force)
@@ -2110,6 +2116,16 @@ class UdockerCLI(object):
             return self.STATUS_ERROR
         Msg().err("Error: unknown image subcommand:", subcmd)
         return self.STATUS_ERROR
+
+    def do_container_prune(self, cmdp):
+        """
+        container prune: remove all stopped containers
+        container prune [-f]
+        """
+        force = self._prune_force(cmdp)
+        if cmdp.missing_options():
+            return self.STATUS_ERROR
+        return extras.system_prune(self.localrepo, "containers", force)
 
     def do_prune(self, cmdp):
         """
@@ -2205,8 +2221,12 @@ class UdockerCLI(object):
             else:
                 Msg().out(json.dumps(data, sort_keys=True, indent=4))
             return self.STATUS_OK
-        if subcmd in ("create", "rm", "remove", "connect", "disconnect",
-                      "prune"):
+        if subcmd == "prune":
+            if not ("-f" in raw or "--force" in raw):
+                Msg().out("WARNING! This will remove all networks not used "
+                          "by containers.", l=Msg.INF)
+            return self.STATUS_OK
+        if subcmd in ("create", "rm", "remove", "connect", "disconnect"):
             Msg().err("Error: network", subcmd, "is not available without"
                       " root/daemon; udocker uses the host network stack")
             return self.STATUS_ERROR
@@ -2462,7 +2482,7 @@ class UdockerCLI(object):
         --no-trunc                 :don't truncate the image id
         --format=json              :print the image list as JSON
         """
-        output_format = cmdp.get("--format=")
+        output_format = cmdp.get("--format=") or ""
         quiet = bool(cmdp.get("-q") or cmdp.get("--quiet"))
         verbose = cmdp.get("-l")
         print_platform = cmdp.get("-p")
@@ -2478,6 +2498,14 @@ class UdockerCLI(object):
                 row = self._image_row(imagerepo, tag, no_trunc)
                 Msg().out(json.dumps(self._image_record(row),
                                      sort_keys=True))
+            return self.STATUS_OK
+
+        if output_format.startswith("table") and \
+                output_format.strip() != "table":
+            records = [self._image_record(self._image_row(imagerepo, tag,
+                                                          no_trunc))
+                       for (imagerepo, tag) in images_list]
+            Msg().out(render_table(output_format, records))
             return self.STATUS_OK
 
         if output_format and output_format != "table":
@@ -2543,7 +2571,7 @@ class UdockerCLI(object):
         """
         filters = list(cmdp.get("-f=", "CMD_OPT", True))
         filters.extend(cmdp.get("--filter=", "CMD_OPT", True))
-        output_format = cmdp.get("--format=")
+        output_format = cmdp.get("--format=") or ""
         show_all = bool(cmdp.get("-a") or cmdp.get("--all"))
         quiet = bool(cmdp.get("-q") or cmdp.get("--quiet"))
         no_trunc = bool(cmdp.get("--no-trunc"))
@@ -2609,6 +2637,13 @@ class UdockerCLI(object):
             for container in selected:
                 Msg().out(json.dumps(self._ps_record(container),
                                      sort_keys=True))
+            return self.STATUS_OK
+
+        if output_format.startswith("table") and \
+                output_format.strip() != "table":
+            Msg().out(render_table(
+                output_format,
+                [self._ps_record(container) for container in selected]))
             return self.STATUS_OK
 
         if output_format and output_format != "table":

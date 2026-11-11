@@ -8,6 +8,7 @@ template text are converted, as docker does for CLI templates.
 """
 
 import json
+import re
 
 NO_VALUE = "<no value>"
 
@@ -75,3 +76,40 @@ def render(template, data):
         result.append(_expression(expression, data))
         index = end + 2
     return "".join(result)
+
+
+def _label(name):
+    """Header label for a template field: Names -> NAMES, CreatedAt ->
+    CREATED AT"""
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", str(name))
+    return spaced.upper()
+
+
+def render_table(template, records):
+    """Render a docker 'table {{.A}}\t{{.B}}' template with a header"""
+    text = template
+    if text.startswith("table "):
+        text = text[len("table "):]
+    columns = text.replace("\\t", "\t").split("\t")
+    header = []
+    for column in columns:
+        found = re.findall(r"\{\{\s*\.?([A-Za-z0-9_.]+)\s*\}\}", column)
+        header.append(_label(found[-1].split(".")[-1]) if found
+                      else column.strip())
+    rows = []
+    for record in records:
+        rendered = render("\t".join(columns), record)
+        rows.append(rendered.split("\t"))
+    widths = [len(cell) for cell in header]
+    for row in rows:
+        for (index, cell) in enumerate(row):
+            if index < len(widths):
+                widths[index] = max(widths[index], len(cell))
+    lines = []
+    lines.append("   ".join(cell.ljust(widths[index])
+                            for (index, cell) in enumerate(header)))
+    for row in rows:
+        cells = [cell.ljust(widths[index]) for (index, cell) in
+                 enumerate(row) if index < len(widths)]
+        lines.append("   ".join(cells).rstrip())
+    return "\n".join(lines)

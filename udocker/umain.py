@@ -22,7 +22,7 @@ COMPAT_GROUPS = {
         "stats": ["stats"], "port": ["port"], "diff": ["diff"],
         "wait": ["wait"], "commit": ["commit"], "cp": ["cp"],
         "rename": ["rename"], "pause": ["pause"],
-        "update": ["update"],
+        "update": ["update"], "prune": ["container-prune"],
         "unpause": ["unpause"],
     },
     "image": {
@@ -181,6 +181,7 @@ class UMain(object):
             "volume": self.cli.do_volume, "info": self.cli.do_info,
             "network": self.cli.do_network, "events": self.cli.do_events,
             "update": self.cli.do_update,
+            "container-prune": self.cli.do_container_prune,
             "pause": self.cli.do_pause, "unpause": self.cli.do_unpause,
         }
 

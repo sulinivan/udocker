@@ -356,15 +356,35 @@ class ExecutionEngineCommon(object):
 
         path = self.opt["env"].getenv("PATH")
         # DEBUG
+        requested = exec_name
         exec_name = FileUtil(exec_name).find_exec(path, self.container_root,
                                                   self.opt["vol"],
                                                   self.opt["cwd"])
         if exec_name:
             return self.container_root + '/' + exec_name
-        self.exit_code = 127
+        self.exit_code = 126 if self._command_exists(requested) else 127
         Msg().err("Error: command not found or has no execute bit set: ",
                   self.opt["cmd"])
         return ""
+
+    def _command_exists(self, exec_name):
+        """Is the command present in the container without the exec bit"""
+        if not isinstance(exec_name, str) or not exec_name:
+            return False
+        if "/" in exec_name:
+            if not exec_name.startswith("/"):
+                exec_name = (self.opt["cwd"] or "/").rstrip("/") + "/" + \
+                    exec_name
+            return os.path.exists(self.container_root + exec_name)
+        path = self.opt["env"].getenv("PATH") or Config.conf['root_path']
+        for directory in path.split(":"):
+            if not directory:
+                continue
+            candidate = (self.container_root + "/" + directory.strip("/") +
+                         "/" + exec_name)
+            if os.path.exists(candidate):
+                return True
+        return False
 
     def _run_load_metadata(self, container_id):
         """Load container metadata from container JSON payload"""

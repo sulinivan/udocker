@@ -3,6 +3,7 @@
 udocker unit tests: ExecutionEngineCommon
 """
 
+import os
 from unittest import TestCase, main
 from unittest.mock import Mock, patch
 from udocker.engine.base import ExecutionEngineCommon
@@ -212,6 +213,33 @@ class ExecutionEngineCommonTestCase(TestCase):
         ex_eng.opt["vol"].append("/HOSTDIR:/CONTDIR")
         status = ex_eng._check_volumes()
         self.assertTrue(status)
+
+    @patch('udocker.engine.base.FileUtil.find_exec')
+    @patch('udocker.engine.base.Uenv')
+    @patch('udocker.engine.base.Msg')
+    def test_29__command_exists(self, mock_msg, mock_uenv, mock_find):
+        """Test29 a command without the exec bit gives exit code 126."""
+        import tempfile
+        tmpdir = tempfile.mkdtemp()
+        try:
+            mock_msg.level = 0
+            mock_find.return_value = ""
+            mock_uenv.getenv.return_value = "/usr/bin"
+            ex_eng = ExecutionEngineCommon(self.local, self.xmode)
+            ex_eng.opt["env"] = mock_uenv
+            ex_eng.opt["cmd"] = ["tool"]
+            ex_eng.opt["entryp"] = ""
+            ex_eng.container_root = tmpdir
+            self.assertFalse(ex_eng._command_exists("tool"))
+            os.makedirs(os.path.join(tmpdir, "usr", "bin"))
+            with open(os.path.join(tmpdir, "usr", "bin", "tool"), "w"):
+                pass
+            self.assertTrue(ex_eng._command_exists("tool"))
+            self.assertEqual(ex_eng._check_executable(), "")
+            self.assertEqual(ex_eng.exit_code, 126)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir)
 
     @patch('udocker.engine.base.Msg')
     @patch('udocker.engine.base.FileUtil')
