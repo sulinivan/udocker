@@ -2076,19 +2076,42 @@ class UdockerCLI(object):
         if not supervisor.is_running(container_dir):
             Msg().err("Error: container is not running")
             return self.STATUS_ERROR
-        (engine, executable) = self._runc_engine(container_id)
-        if not executable:
-            return self.STATUS_ERROR
-        run_user = ""
-        if user:
-            run_user = supervisor.resolve_user(container_dir, user)
-            if not run_user:
-                Msg().err("Error: user not found in container:", user)
+        exec_mode = ExecutionMode(self.localrepo, container_id)
+        mode = exec_mode.get_mode()
+        if isinstance(mode, str) and mode.startswith("R"):
+            (engine, executable) = self._runc_engine(container_id)
+            if not executable:
                 return self.STATUS_ERROR
-        return supervisor.exec_command(
-            container_dir, executable, command, user=run_user,
-            workdir=workdir, env_vars=env_vars, tty=tty,
-            topdir=Config.conf['topdir'])
+            run_user = ""
+            if user:
+                run_user = supervisor.resolve_user(container_dir, user)
+                if not run_user:
+                    Msg().err("Error: user not found in container:", user)
+                    return self.STATUS_ERROR
+            return supervisor.exec_command(
+                container_dir, executable, command, user=run_user,
+                workdir=workdir, env_vars=env_vars, tty=tty,
+                topdir=Config.conf['topdir'])
+        if not (isinstance(mode, str) and mode[:1] in ("P", "F")):
+            Msg().err("Error: exec is supported in P, F and R modes;"
+                      " singularity is not supported")
+            return self.STATUS_ERROR
+        if user:
+            Msg().out("Warning: -u is only honoured in R modes, ignored",
+                      l=Msg.WAR)
+        engine = exec_mode.get_engine()
+        if not engine:
+            Msg().err("Error: no execution engine for this execmode")
+            return self.STATUS_ERROR
+        engine.opt.setdefault("kernel", "")
+        engine.opt.setdefault("netcoop", False)
+        engine.opt.setdefault("platform", "")
+        status = engine.exec_command(container_id, command,
+                                     cwd=workdir or "",
+                                     env_vars=env_vars)
+        if getattr(engine, "exit_code", 0) in (126, 127):
+            return engine.exit_code
+        return status
 
     def do_logs(self, cmdp):
         """

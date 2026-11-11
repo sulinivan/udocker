@@ -466,5 +466,37 @@ class DockerCompatOutputTestCase(TestCase):
         self.assertIsNone(cli._health_config(container_dir,
                                              {"healthcmd": "NONE"}))
 
+    def test_15_exec_p_mode(self):
+        """Test15 exec runs through the engine in P/F modes"""
+        localrepo = Mock()
+        localrepo.get_container_id.return_value = "CID"
+        localrepo.cd_container.return_value = "/containers/CID"
+        cli = self._cli(localrepo)
+        engine = Mock()
+        engine.opt = {}
+        engine.exec_command.return_value = 4
+        exec_mode = Mock()
+        exec_mode.get_mode.return_value = "P1"
+        exec_mode.get_engine.return_value = engine
+        cmdp = CmdParser()
+        cmdp.parse(["udocker", "exec", "-e", "A=1", "CID", "sh", "-c",
+                    "exit 4"])
+        with patch('udocker.cli.ExecutionMode', return_value=exec_mode), \
+                patch('udocker.cli.supervisor.is_running',
+                      return_value=True):
+            self.assertEqual(cli.do_exec(cmdp), 4)
+        call = engine.exec_command.call_args
+        self.assertEqual(call[0][0], "CID")
+        self.assertEqual(call[0][1], ["sh", "-c", "exit 4"])
+        self.assertEqual(call[1]["env_vars"], ["A=1"])
+        cmdp = CmdParser()
+        cmdp.parse(["udocker", "exec", "CID", "true"])
+        exec_mode.get_mode.return_value = "S1"
+        with patch('udocker.cli.ExecutionMode', return_value=exec_mode), \
+                patch('udocker.cli.supervisor.is_running',
+                      return_value=True), \
+                patch('udocker.cli.Msg'):
+            self.assertEqual(cli.do_exec(cmdp), 1)
+
 if __name__ == '__main__':
     main()

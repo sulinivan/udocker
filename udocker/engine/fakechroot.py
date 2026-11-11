@@ -285,22 +285,8 @@ class FakechrootEngine(ExecutionEngineCommon):
         Msg().err("Error: sh not found")
         sys.exit(1)
 
-    def run(self, container_id):
-        """Execute a Docker container using Fakechroot. This is the main
-        method invoked to run the a container with Fakechroot.
-          * argument: container_id or name
-          * options:  many via self.opt see the help
-        """
-
-        # warning root execution not supported
-        self._uid_check()
-
-        # setup execution
-        exec_path = self._run_init(container_id)
-        if not exec_path:
-            return 2
-        exec_path = os.path.normpath(exec_path)
-
+    def _build_command_line(self, exec_path):
+        """Build the fakechroot command line for self.opt["cmd"]"""
         self._check_arch()
         self._run_invalid_options()
 
@@ -330,10 +316,49 @@ class FakechrootEngine(ExecutionEngineCommon):
                 cmd_l.append(container_loader)
         cmd_l.extend(self._run_add_script_support(exec_path))
         cmd_l.extend(self.opt["cmd"])
+        cwd = FileUtil(self.container_root).cont2host(self.opt["cwd"],
+                                                      self.opt["vol"])
+        return cmd_l, cwd
+
+    def run(self, container_id):
+        """Execute a Docker container using Fakechroot. This is the main method
+        invoked to run the a container with Fakechroot.
+          * argument: container_id or name
+          * options:  many via self.opt see the help
+        """
+
+        # warning root execution not supported
+        self._uid_check()
+
+        # setup execution
+        exec_path = self._run_init(container_id)
+        if not exec_path:
+            return 2
+        exec_path = os.path.normpath(exec_path)
+
+        cmd_l, cwd = self._build_command_line(exec_path)
         Msg().out("CMD =", cmd_l, l=Msg.VER)
 
         # execute
         self._run_banner(self.opt["cmd"][0], '#')
-        cwd = FileUtil(self.container_root).cont2host(self.opt["cwd"],
-                                                      self.opt["vol"])
         return self._exec_command(cmd_l, cwd=cwd)
+
+    def exec_command(self, container_id, command, cwd="", env_vars=None):
+        """Run a command in the container without starting an init process"""
+        saved_environ = dict(os.environ)
+        try:
+            self._uid_check()
+            self.opt["cmd"] = list(command)
+            exec_path = self._run_init(container_id)
+            if not exec_path:
+                return 2
+            exec_path = os.path.normpath(exec_path)
+            if cwd:
+                self.opt["cwd"] = cwd
+            for item in env_vars or []:
+                self.opt["env"].append(item)
+            cmd_l, run_cwd = self._build_command_line(exec_path)
+            return self._exec_command(cmd_l, cwd=run_cwd)
+        finally:
+            os.environ.clear()
+            os.environ.update(saved_environ)

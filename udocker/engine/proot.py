@@ -129,17 +129,8 @@ class PRootEngine(ExecutionEngineCommon):
         qemu_filename = self._get_qemu()
         return ["-q", qemu_filename] if qemu_filename else []
 
-    def run(self, container_id):
-        """Execute a Docker container using PRoot. This is the main method
-        invoked to run the a container with PRoot.
-          * argument: container_id or name
-          * options:  many via self.opt see the help
-        """
-
-        # setup execution
-        if not self._run_init(container_id):
-            return 2
-
+    def _build_command_line(self):
+        """Build the PRoot command line for self.opt["cmd"]"""
         self.select_proot()
 
         # seccomp and ptrace behavior change on 4.8.0 onwards
@@ -191,17 +182,49 @@ class PRootEngine(ExecutionEngineCommon):
         if self.opt["cwd"]:  # set current working directory
             cmd_l.extend(["-w", self.opt["cwd"], ])
         cmd_l.extend(self.opt["cmd"])
-        Msg().out("CMD =", cmd_l, l=Msg.VER)
+        return cmd_l
 
-        # cleanup the environment
+    def _prepare_environment(self):
+        """Clean the host environment and set PROOT_TMP_DIR"""
         self._run_env_cleanup_dict()
-
         # proot needs a tmp dir that it can canonicalize; the host TMPDIR
         # is dropped by the environment cleanup and may not be usable
         if not os.environ.get("PROOT_TMP_DIR"):
             os.environ["PROOT_TMP_DIR"] = Config.conf['tmpdir']
         os.environ.update(self.opt["env"].dict())
 
-        # execute
+    def run(self, container_id):
+        """Execute a Docker container using PRoot. This is the main method
+        invoked to run the a container with PRoot.
+          * argument: container_id or name
+          * options:  many via self.opt see the help
+        """
+
+        # setup execution
+        if not self._run_init(container_id):
+            return 2
+
+        cmd_l = self._build_command_line()
+        Msg().out("CMD =", cmd_l, l=Msg.VER)
+        self._prepare_environment()
         self._run_banner(self.opt["cmd"][0])
         return self._exec_command(cmd_l)
+
+    def exec_command(self, container_id, command, cwd="", env_vars=None):
+        """Run a command in the container without starting an init process"""
+        saved_environ = dict(os.environ)
+        try:
+            self.opt["cmd"] = list(command)
+            if not self._run_init(container_id):
+                return 2
+            if cwd:
+                self.opt["cwd"] = cwd
+            for item in env_vars or []:
+                self.opt["env"].append(item)
+            cmd_l = self._build_command_line()
+            Msg().out("CMD =", cmd_l, l=Msg.VER)
+            self._prepare_environment()
+            return self._exec_command(cmd_l)
+        finally:
+            os.environ.clear()
+            os.environ.update(saved_environ)
